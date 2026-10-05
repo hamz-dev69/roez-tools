@@ -86,14 +86,14 @@ Make sure `$HOME/go/bin` is in your `PATH`.
 ## Usage
 
 ```bash
-python3 roeztools.py
+python3 roez-tools.py
 ```
 
 Or make it executable and run it directly:
 
 ```bash
 chmod +x roeztools.py
-./roeztools.py
+./roez-tools.py
 ```
 
 Select a feature by typing its number at the `roez@tools ❯` prompt and pressing Enter. After each tool finishes, press Enter to return to the menu.
