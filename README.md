@@ -62,6 +62,10 @@ sudo apt install curl whois dnsutils libimage-exiftool-perl neofetch
 **3. Install Python packages**
 
 ```bash
+pip3 install -r requirements.txt
+```
+Or 
+```bash
 pip3 install -r requirements.txt --break-system-packages
 ```
 
