@@ -96,7 +96,7 @@ python3 roez-tools.py
 Or make it executable and run it directly:
 
 ```bash
-chmod +x roeztools.py
+chmod +x roez-tools.py
 ./roez-tools.py
 ```
 
@@ -105,40 +105,32 @@ Select a feature by typing its number at the `roez@tools ❯` prompt and pressin
 ### Run it from anywhere (optional)
 
 ```bash
-sudo cp roeztools.py /usr/local/bin/roez
+sudo cp roez-tools.py /usr/local/bin/roez
 sudo chmod +x /usr/local/bin/roez
 ```
 
 Then start it with `roez` from any directory.
 
-## Project structure
-
-```
-roez-tools/
-├── assets/
-│   └── screenshot.png
-├── roeztools.py
-├── requirements.txt
-└── README.md
-```
-
 ## Platform support
 
 ROEZ TOOLS targets Linux. It calls `clear` and `which`, which do not exist on native Windows, so it will not work correctly in Command Prompt or PowerShell. On Windows, run it inside [WSL](https://learn.microsoft.com/windows/wsl/).
 
-## Notes on external services
+## Notes
 
-- **Features 1 and 2** send requests to third-party services (`api.ipify.org` and `ip-api.com`). The free tier of ip-api.com is rate limited (about 45 requests per minute) and intended for non-commercial use.
-- **Features 4 and 5** make requests to many websites in a single run. Scan times vary with your connection and can take a while for Sherlock.
-- **Results are not guaranteed to be complete or accurate.** Sites change their behavior, and username or email matches can be false positives. Verify findings before relying on them.
-
-## Legal disclaimer
-
-This project is intended for education, security research, and investigations you are authorized to perform. Run it only against targets you own or have explicit permission to test, and follow the laws that apply where you live. The author is not responsible for misuse or for any damage caused by this software.
+- Some features use third-party services and may have rate limits.
+- Results may be incomplete or inaccurate. Verify findings independently.
+- Use this tool only on targets you own or are authorized to investigate.
 
 ## Credits
 
-ROEZ TOOLS is a front end for the work of others. Full credit to the authors and maintainers of [Holehe](https://github.com/megadose/holehe), [Sherlock](https://github.com/sherlock-project/sherlock), [Subfinder](https://github.com/projectdiscovery/subfinder), [ExifTool](https://exiftool.org), [python-phonenumbers](https://github.com/daviddrysdale/python-phonenumbers), and the [ip-api](https://ip-api.com) and [ipify](https://www.ipify.org) services.
+ROEZ TOOLS integrates work from the authors and maintainers of
+[Holehe](https://github.com/megadose/holehe),
+[Sherlock](https://github.com/sherlock-project/sherlock),
+[Subfinder](https://github.com/projectdiscovery/subfinder),
+[ExifTool](https://exiftool.org/),
+[phonenumbers](https://github.com/daviddrysdale/python-phonenumbers),
+and the [ip-api](https://ip-api.com/) and
+[ipify](https://www.ipify.org/) services.
 
 ## Author
 
