@@ -30,10 +30,8 @@ LOGO = [
     r"",
 ]
 
-GRADIENT = [196, 202, 208, 214, 220, 226]  # merah -> kuning
+GRADIENT = [196, 202, 208, 214, 220, 226]  
 
-
-# ─────────────────────────── HELPER ───────────────────────────
 
 def clear():
     os.system("clear")
@@ -146,7 +144,7 @@ def valid_domain(d):
     return bool(re.match(r"^([a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$", d))
 
 
-# ─────────────────────────── FITUR 1-5 ───────────────────────────
+# FITUR 1-5 
 
 def check_ip():
     clear()
@@ -358,7 +356,7 @@ def sherlock_check():
         else:
             cmd_list = ["sherlock", username]
 
-        result = run_with_spinner(cmd_list, "Scanning username (bisa agak lama)")
+        result = run_with_spinner(cmd_list, "Scanning username")
 
         found = []
         for line in result.splitlines():
