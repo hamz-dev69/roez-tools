@@ -144,7 +144,6 @@ def valid_domain(d):
     return bool(re.match(r"^([a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$", d))
 
 
-# FITUR 1-5 
 
 def check_ip():
     clear()
@@ -383,8 +382,6 @@ def sherlock_check():
     print()
     input(CYAN + "  Tekan Enter untuk kembali ke menu..." + RESET)
 
-
-# ─────────────────────────── FITUR 6-10 (BARU) ───────────────────────────
 
 def phone_osint():
     screen("PHONE NUMBER OSINT")
