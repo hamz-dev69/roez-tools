@@ -1,16 +1,25 @@
 #!/usr/bin/env python3
 
-import os
-import sys
-import socket
-import platform
-import subprocess
+import argparse
+import collections
+import glob
+import importlib.util
+import itertools
 import json
+import os
+import platform
+import re
+import shutil
+import signal
+import site
+import socket
+import ssl
+import subprocess
+import sys
+import sysconfig
+import tempfile
 import threading
 import time
-import itertools
-import ssl
-import re
 
 RED    = "\033[1;31m"
 GREEN  = "\033[1;32m"
@@ -30,11 +39,57 @@ LOGO = [
     r"",
 ]
 
-GRADIENT = [196, 202, 208, 214, 220, 226]  
+GRADIENT = [196, 202, 208, 214, 220, 226]
 
+
+# ═══════════════════════════ KONFIGURASI ═══════════════════════════
+
+# Environment terisolasi (venv) khusus ROEZ TOOLS. Dipakai supaya install
+# tidak diblokir PEP 668 dan tidak mengotori Python sistem.
+APP_DIR   = os.path.join(
+    os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share"),
+    "roez-tools",
+)
+VENV_DIR  = os.path.join(APP_DIR, "venv")
+VENV_PY   = os.path.join(VENV_DIR, "bin", "python")
+LOG_FILE  = os.path.join(APP_DIR, "install.log")
+SKIP_FILE = os.path.join(APP_DIR, "skip_setup")
+
+HOLEHE_TIMEOUT         = 300   # detik, batas total scan email
+SHERLOCK_REQ_TIMEOUT   = 15    # detik per request (default sherlock = 60)
+SHERLOCK_TOTAL_TIMEOUT = 900   # detik, batas total scan username
+
+# key -> info paket. "probe" = perintah import yang membuktikan paket benar-benar jalan.
+DEPS = collections.OrderedDict([
+    ("phonenumbers", {"pip": "phonenumbers",     "module": "phonenumbers",    "probe": "import phonenumbers",
+                      "script": None,            "min_py": None}),
+    ("holehe",       {"pip": "holehe",           "module": "holehe",          "probe": "import holehe.core",
+                      "script": "holehe",        "min_py": None}),
+    ("sherlock",     {"pip": "sherlock-project", "module": "sherlock_project", "probe": "import sherlock_project.sherlock",
+                      "script": "sherlock",      "min_py": (3, 9)}),
+])
+
+# holehe menjalankan check_update() SEBELUM scan: ia melakukan `pip3 install --upgrade holehe`
+# lalu exit() tanpa hasil apa pun kalau versinya beda dengan PyPI (gagal total di sistem PEP 668,
+# crash kalau offline). Di sini fungsi itu dinonaktifkan, sisanya dijalankan apa adanya.
+HOLEHE_BOOT = (
+    "import holehe.core as c\n"
+    "if hasattr(c, 'check_update'):\n"
+    "    c.check_update = lambda *a, **k: None\n"
+    "c.main()\n"
+)
+
+EMAIL_RE    = re.compile(r"^(?!-)[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+USERNAME_RE = re.compile(r"^(?!-)\S{1,64}$")
+ANSI_RE     = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+SHERLOCK_FOUND_RE = re.compile(r"^\[\+\]\s*(.+?):\s*(https?://\S+)\s*$")
+
+
+# ═══════════════════════════ UI (tidak diubah) ═══════════════════════════
 
 def clear():
-    os.system("clear")
+    sys.stdout.write("\033[H\033[2J\033[3J")
+    sys.stdout.flush()
 
 
 def get_terminal_width():
@@ -82,47 +137,12 @@ def print_menu():
     print()
 
 
-def run_with_spinner(cmd, text="Scanning"):
-    done = threading.Event()
-
-    def spin():
-        for ch in itertools.cycle("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"):
-            if done.is_set():
-                break
-            sys.stdout.write(f"\r{CYAN}  {ch} {text}...{RESET}")
-            sys.stdout.flush()
-            time.sleep(0.08)
-
-    t = threading.Thread(target=spin, daemon=True)
-    t.start()
-    try:
-        return subprocess.check_output(
-            cmd,
-            stderr=subprocess.DEVNULL
-        ).decode(errors="ignore")
-    finally:
-        done.set()
-        t.join()
-        sys.stdout.write("\r" + " " * 50 + "\r")
-        sys.stdout.flush()
-
-
-def has_cmd(cmd):
-    return subprocess.call(["which", cmd], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
-
-
-def run_text(cmd, timeout=15):
-    """Jalankan command, balikin stdout (nggak error walau exit code != 0)."""
-    try:
-        r = subprocess.run(cmd, capture_output=True, timeout=timeout)
-        return r.stdout.decode(errors="ignore")
-    except Exception:
-        return ""
-
-
 def pause():
     print()
-    input(CYAN + "  Tekan Enter untuk kembali ke menu..." + RESET)
+    try:
+        input(CYAN + "  Tekan Enter untuk kembali ke menu..." + RESET)
+    except EOFError:
+        pass
 
 
 def screen(title):
@@ -131,6 +151,42 @@ def screen(title):
     width = get_terminal_width()
     print(YELLOW + BOLD + f"  {title}".center(width) + RESET)
     print()
+
+
+def confirm(prompt, default=True):
+    """Tanya y/n. Tanpa terminal interaktif -> pakai default."""
+    if not sys.stdin.isatty():
+        return default
+    try:
+        ans = input(CYAN + prompt + WHITE).strip().lower()
+    except EOFError:
+        ans = ""
+    finally:
+        sys.stdout.write(RESET)
+    if not ans:
+        return default
+    return ans in ("y", "ya", "yes")
+
+
+# ═══════════════════════════ UTIL TEKS ═══════════════════════════
+
+def strip_ansi(text):
+    return ANSI_RE.sub("", text or "")
+
+
+def tail_lines(text, n=5):
+    """n baris terakhir yang bermakna (tanpa baris kosong / progress bar)."""
+    out = []
+    for raw in strip_ansi(text).splitlines():
+        line = raw.strip()
+        if not line or "%|" in line or "it/s]" in line:
+            continue
+        out.append(line)
+    return out[-n:]
+
+
+def fmt_duration(seconds):
+    return "%d menit" % (seconds // 60) if seconds >= 60 and seconds % 60 == 0 else "%d detik" % seconds
 
 
 def clean_domain(raw):
@@ -144,13 +200,595 @@ def valid_domain(d):
     return bool(re.match(r"^([a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$", d))
 
 
+def extend_path():
+    """Tambahkan folder bin yang sering tidak ada di PATH (~/.local/bin, ~/go/bin, dll)."""
+    home = os.path.expanduser("~")
+    extra = [
+        os.path.join(home, ".local", "bin"),
+        os.path.join(home, "go", "bin"),
+        "/usr/local/go/bin", "/snap/bin", "/usr/local/bin",
+        "/usr/local/sbin", "/usr/sbin", "/sbin",
+    ]
+    gopath = os.environ.get("GOPATH")
+    if gopath:
+        extra.append(os.path.join(gopath, "bin"))
+    current = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+    add = [p for p in extra if os.path.isdir(p) and p not in current]
+    if add:
+        os.environ["PATH"] = os.pathsep.join(current + add)
+
+
+def has_cmd(cmd):
+    return shutil.which(cmd) is not None
+
+
+def check_internet(timeout=2):
+    """True kalau ada koneksi keluar. Lewati cek kalau pakai proxy."""
+    for k in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+        if os.environ.get(k):
+            return True
+    for host, port in (("1.1.1.1", 443), ("8.8.8.8", 53), ("github.com", 443)):
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+# ═══════════════════════════ RUNNER PROSES ═══════════════════════════
+
+RunResult = collections.namedtuple("RunResult", "out err rc timed_out interrupted")
+
+
+def _signal_group(proc, sig):
+    try:
+        os.killpg(proc.pid, sig)
+    except Exception:
+        try:
+            proc.send_signal(sig)
+        except Exception:
+            pass
+
+
+def _terminate(proc):
+    """SIGTERM ke seluruh process group, SIGKILL kalau masih hidup setelah 3 detik."""
+    if proc.poll() is not None:
+        return
+    _signal_group(proc, signal.SIGTERM)
+
+    def _escalate():
+        time.sleep(3)
+        if proc.poll() is None:
+            _signal_group(proc, signal.SIGKILL)
+
+    threading.Thread(target=_escalate, daemon=True).start()
+
+
+def run_command(cmd, timeout=120, cwd=None, on_line=None):
+    """
+    Jalankan command, baca stdout baris-per-baris (live), dengan batas waktu.
+    Tidak melempar exception karena exit code != 0; Ctrl+C membunuh proses anak
+    dan ditandai lewat `interrupted` supaya hasil sebagian tetap bisa ditampilkan.
+    """
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"       # tanpa ini output python anak datang sekaligus di akhir
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONWARNINGS"] = "ignore"
+
+    errf = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="ignore")
+    try:
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=errf,
+            cwd=cwd, env=env, text=True, encoding="utf-8", errors="ignore",
+            bufsize=1, start_new_session=True,
+        )
+    except OSError as e:
+        errf.close()
+        return RunResult("", str(e), 127, False, False)
+
+    state = {"timed_out": False}
+
+    def _on_timeout():
+        state["timed_out"] = True
+        _terminate(proc)
+
+    timer = threading.Timer(timeout, _on_timeout)
+    timer.daemon = True
+    timer.start()
+
+    lines = []
+    interrupted = False
+    try:
+        for raw in proc.stdout:
+            line = raw.rstrip("\r\n")
+            lines.append(line)
+            if on_line:
+                try:
+                    on_line(line)
+                except Exception:
+                    pass
+    except KeyboardInterrupt:
+        interrupted = True
+        _terminate(proc)
+    finally:
+        timer.cancel()
+
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        _signal_group(proc, signal.SIGKILL)
+        proc.wait()
+    try:
+        proc.stdout.close()
+    except Exception:
+        pass
+    try:
+        errf.seek(0)
+        err = errf.read()
+    except Exception:
+        err = ""
+    finally:
+        errf.close()
+
+    return RunResult("\n".join(lines), err, proc.returncode, state["timed_out"], interrupted)
+
+
+class Spinner(object):
+    FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def __init__(self, label, elapsed=True):
+        self.label = label
+        self.elapsed = elapsed
+        self._stop = threading.Event()
+        self._thread = None
+        self._t0 = time.time()
+        self._tty = sys.stdout.isatty()
+
+    def _text(self):
+        try:
+            text = self.label() if callable(self.label) else str(self.label)
+        except Exception:
+            text = "Memproses"
+        text += "..."
+        if self.elapsed:
+            s = int(time.time() - self._t0)
+            text += " %02d:%02d" % (s // 60, s % 60)
+        return text
+
+    def _run(self):
+        for ch in itertools.cycle(self.FRAMES):
+            if self._stop.is_set():
+                break
+            sys.stdout.write("\r\033[K%s  %s %s%s" % (CYAN, ch, self._text(), RESET))
+            sys.stdout.flush()
+            time.sleep(0.08)
+
+    def __enter__(self):
+        self._t0 = time.time()
+        if self._tty:
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        if self._thread:
+            self._thread.join()
+        if self._tty:
+            sys.stdout.write("\r\033[K")
+            sys.stdout.flush()
+        return False
+
+
+def run_with_spinner(cmd, text="Scanning", timeout=120, cwd=None):
+    """Versi sederhana: balikin stdout (str). Error hanya kalau tidak ada output sama sekali."""
+    with Spinner(text):
+        res = run_command(cmd, timeout=timeout, cwd=cwd)
+    if res.interrupted:
+        raise KeyboardInterrupt
+    has_out = bool(res.out.strip())
+    if res.timed_out:
+        if not has_out:
+            raise RuntimeError("Timeout setelah %d detik" % timeout)
+        print(YELLOW + "  ⚠ Timeout %d detik - hasil mungkin tidak lengkap." % timeout + RESET)
+    elif res.rc != 0 and not has_out:
+        tail = tail_lines(res.err, 3)
+        raise RuntimeError(" | ".join(tail) if tail else "proses berhenti dengan kode %s" % res.rc)
+    return res.out
+
+
+def run_text(cmd, timeout=15):
+    """Jalankan command, balikin stdout (nggak error walau exit code != 0)."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        return r.stdout.decode(errors="ignore")
+    except Exception:
+        return ""
+
+
+# ═══════════════════════════ MANAJER DEPENDENSI ═══════════════════════════
+#
+# Kenapa dulu tools OSINT sering "tidak ditemukan":
+#  1. pip3 install di Ubuntu 23.04+/Debian 12+/Kali baru ditolak (PEP 668).
+#  2. pip install -r gagal ATOMIK: satu paket gagal (mis. sherlock-project butuh
+#     Python 3.9+) -> holehe & phonenumbers ikut tidak terpasang.
+#  3. Script di ~/.local/bin tidak ada di PATH -> `which holehe` gagal.
+#  4. phonenumbers terpasang di Python/pip yang berbeda dari `python3` yang dipakai.
+# Solusi: paket dipasang SATU-SATU ke venv privat, dan dipakai lewat interpreter-nya.
+
+_STATUS_CACHE = {}
+
+
+def reset_status_cache():
+    _STATUS_CACHE.clear()
+
+
+def log(msg):
+    try:
+        os.makedirs(APP_DIR, exist_ok=True)
+        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 1024 * 1024:
+            os.remove(LOG_FILE)
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write("[%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+    except OSError:
+        pass
+
+
+def extra_site_paths():
+    """site-packages venv privat + user site, untuk import in-process (phonenumbers)."""
+    paths = []
+    for p in sorted(glob.glob(os.path.join(VENV_DIR, "lib", "python3*", "site-packages"))):
+        paths.append(p)
+    try:
+        paths.append(site.getusersitepackages())
+    except Exception:
+        pass
+    return [p for p in paths if os.path.isdir(p)]
+
+
+def try_import_phonenumbers():
+    """(module | None, error_text). Coba juga site-packages venv privat."""
+    err = ""
+    for attempt in (0, 1):
+        try:
+            import phonenumbers
+            return phonenumbers, ""
+        except ImportError as e:
+            err = str(e)
+        except Exception as e:                       # paket rusak
+            return None, "%s: %s" % (type(e).__name__, e)
+        if attempt == 0:
+            for p in extra_site_paths():
+                if p not in sys.path:
+                    sys.path.append(p)
+            importlib.invalidate_caches()
+    return None, err
+
+
+def shebang_python(path):
+    """Interpreter dari shebang script (mis. holehe/sherlock yang dipasang pipx)."""
+    try:
+        with open(path, "rb") as f:
+            first = f.readline(512).decode("utf-8", "ignore").strip()
+    except OSError:
+        return None
+    if not first.startswith("#!"):
+        return None
+    parts = first[2:].split()
+    if not parts:
+        return None
+    if os.path.basename(parts[0]) == "env":
+        for tok in parts[1:]:
+            if not tok.startswith("-"):
+                return shutil.which(tok)
+        return None
+    return parts[0] if os.path.exists(parts[0]) else None
+
+
+def candidate_pythons(dep):
+    cands = []
+
+    def add(p):
+        if p and os.path.exists(p) and p not in cands:
+            cands.append(p)
+
+    add(sys.executable)
+    add(VENV_PY)
+    if dep.get("script"):
+        exe = shutil.which(dep["script"])
+        if exe:
+            add(shebang_python(exe))
+    return cands
+
+
+def module_present(py, module):
+    r = run_command(
+        [py, "-c", "import importlib.util as u, sys; sys.exit(0 if u.find_spec(sys.argv[1]) else 1)", module],
+        timeout=30,
+    )
+    return r.rc == 0
+
+
+def import_probe(py, probe):
+    r = run_command([py, "-c", probe], timeout=90)
+    if r.rc == 0:
+        return True, ""
+    return False, " | ".join(tail_lines(r.err or r.out, 3)) or "import gagal (kode %s)" % r.rc
+
+
+def dep_status(key, deep=False):
+    """
+    -> (ok, python_path, error_text)
+    deep=False : cek cepat (modul ada?)    deep=True : benar-benar import (terbukti jalan)
+    """
+    ck = (key, deep)
+    if ck in _STATUS_CACHE:
+        return _STATUS_CACHE[ck]
+    dep = DEPS[key]
+
+    if key == "phonenumbers":
+        mod, err = try_import_phonenumbers()
+        res = (mod is not None, sys.executable if mod else None, err if mod is None and "No module named" not in err else "")
+        _STATUS_CACHE[ck] = res
+        return res
+
+    res = (False, None, "")
+    first_err = ""
+    for py in candidate_pythons(dep):
+        if not module_present(py, dep["module"]):
+            continue
+        if not deep:
+            res = (True, py, "")
+            break
+        ok, err = import_probe(py, dep["probe"])
+        if ok:
+            res = (True, py, "")
+            break
+        first_err = first_err or err
+    else:
+        res = (False, None, first_err)
+    _STATUS_CACHE[ck] = res
+    return res
+
+
+def venv_healthy():
+    if not os.path.isfile(VENV_PY):
+        return False
+    return run_command([VENV_PY, "-m", "pip", "--version"], timeout=60).rc == 0
+
+
+def ensure_venv():
+    if venv_healthy():
+        print(GREEN + "  ✔ Environment terisolasi siap" + RESET)
+        return True
+    if os.path.isdir(VENV_DIR) and os.path.basename(VENV_DIR) == "venv":
+        shutil.rmtree(VENV_DIR, ignore_errors=True)       # venv rusak (mis. Python sistem di-upgrade)
+    try:
+        os.makedirs(APP_DIR, exist_ok=True)
+    except OSError as e:
+        print(RED + "  ✘ Tidak bisa membuat folder %s: %s" % (APP_DIR, e) + RESET)
+        return False
+    with Spinner("Membuat environment terisolasi"):
+        r = run_command([sys.executable, "-m", "venv", VENV_DIR], timeout=180)
+    log("venv create rc=%s\n%s\n%s" % (r.rc, r.out, r.err))
+    if r.rc == 0 and venv_healthy():
+        print(GREEN + "  ✔ Environment terisolasi dibuat" + RESET)
+        return True
+    if os.path.isdir(VENV_DIR) and os.path.basename(VENV_DIR) == "venv":
+        shutil.rmtree(VENV_DIR, ignore_errors=True)
+    low = (r.out + r.err).lower()
+    if "ensurepip" in low or "python3-venv" in low or "-venv" in low:
+        print(YELLOW + "  ⚠ Modul venv belum terpasang di sistem. Install dulu:" + RESET)
+        print(CYAN + "    sudo apt install python3-venv python3-pip" + RESET)
+    else:
+        for line in tail_lines(r.out + "\n" + r.err, 3):
+            print(RED + "    " + line + RESET)
+    return False
+
+
+def pip_hint(text, pkg):
+    low = (text or "").lower()
+    if "externally-managed-environment" in low:
+        return "pip global diblokir (PEP 668). Solusi: sudo apt install python3-venv, lalu jalankan python3 roez-tools.py --setup"
+    if "no matching distribution" in low or "requires a different python" in low or "requires-python" in low:
+        return "Versi Python kamu (%d.%d) tidak didukung oleh %s." % (sys.version_info[0], sys.version_info[1], pkg)
+    if "failed building wheel" in low or "python.h" in low or "gcc" in low:
+        return "Gagal compile. Coba: sudo apt install build-essential python3-dev"
+    if ("name resolution" in low or "connection" in low or "timed out" in low
+            or "network is unreachable" in low or "ssl" in low):
+        return "Masalah koneksi internet/DNS saat download paket."
+    if "permission denied" in low:
+        return "Izin akses ditolak. Jangan campur sudo dan non-sudo untuk folder yang sama."
+    return ""
+
+
+def pip_install(py, pkg, repair=False, user=False, break_system=False):
+    cmd = [py, "-m", "pip", "install", "--disable-pip-version-check", "--no-input", "--upgrade"]
+    if repair:
+        cmd.append("--force-reinstall")
+    if user:
+        cmd.append("--user")
+    if break_system:
+        cmd.append("--break-system-packages")
+    cmd.append(pkg)
+    with Spinner("Menginstall %s" % pkg):
+        r = run_command(cmd, timeout=900)
+    log("pip install %s rc=%s timed_out=%s\n%s\n%s" % (pkg, r.rc, r.timed_out, r.out, r.err))
+    return r
+
+
+def user_install(pkg, repair=False):
+    """Cadangan kalau venv tidak bisa dibuat: pip --user (dengan izin eksplisit untuk PEP 668)."""
+    r = pip_install(sys.executable, pkg, repair=repair, user=True)
+    text = r.out + "\n" + r.err
+    if r.rc != 0 and "externally-managed-environment" in text.lower():
+        print(YELLOW + "  ⚠ Sistem memblokir pip global (PEP 668)." + RESET)
+        if confirm("  Lanjut pakai --user --break-system-packages? [y/N]: ", False):
+            r = pip_install(sys.executable, pkg, repair=repair, user=True, break_system=True)
+    elif r.rc != 0 and "no module named pip" in text.lower():
+        print(YELLOW + "  ⚠ pip belum terpasang: sudo apt install python3-pip" + RESET)
+    return r
+
+
+def setup_environment(keys=None, repair=False):
+    """Pasang dependensi OSINT satu-satu. Return {key: bool}."""
+    keys = list(keys) if keys else list(DEPS)
+    results = {}
+    todo = []
+    for k in keys:
+        mp = DEPS[k]["min_py"]
+        if mp and sys.version_info[:2] < mp:
+            print(YELLOW + "  ⚠ %s butuh Python %d.%d+ (kamu pakai %d.%d) - dilewati." % (
+                DEPS[k]["pip"], mp[0], mp[1], sys.version_info[0], sys.version_info[1]) + RESET)
+            results[k] = False
+        else:
+            todo.append(k)
+    if not todo:
+        return results
+
+    if not check_internet():
+        print(RED + "  ✘ Tidak ada koneksi internet. Install dibatalkan." + RESET)
+        for k in todo:
+            results[k] = False
+        return results
+
+    use_venv = ensure_venv()
+    if not use_venv:
+        print(YELLOW + "  ⚠ Beralih ke install level user (pip --user)." + RESET)
+
+    for k in todo:
+        pkg = DEPS[k]["pip"]
+        r = pip_install(VENV_PY, pkg, repair=repair) if use_venv else user_install(pkg, repair=repair)
+        reset_status_cache()
+        ok, _, err = dep_status(k, deep=True)
+        if ok:
+            print(GREEN + "  ✔ %s siap dipakai" % pkg + RESET)
+        else:
+            print(RED + "  ✘ %s gagal" % pkg + RESET)
+            hint = pip_hint(r.out + "\n" + r.err, pkg)
+            if hint:
+                print(YELLOW + "    " + hint + RESET)
+            for line in (tail_lines(err, 2) if err else tail_lines(r.err or r.out, 3)):
+                print(WHITE + "    " + line + RESET)
+            print(CYAN + "    Log lengkap: " + LOG_FILE + RESET)
+        results[k] = ok
+
+    if all(results.get(k) for k in todo):
+        try:
+            os.remove(SKIP_FILE)
+        except OSError:
+            pass
+    return results
+
+
+def ensure_dep(key):
+    """Pastikan dependensi siap. Kalau belum, tawarkan install otomatis. Return bool."""
+    ok, _, err = dep_status(key, deep=True)
+    if ok:
+        return True
+    dep = DEPS[key]
+    name = dep["pip"]
+    if err:
+        print(RED + "  ✘ %s terpasang tapi gagal dijalankan:" % name + RESET)
+        print(WHITE + "    " + err + RESET)
+    else:
+        print(RED + "  ✘ %s tidak ditemukan!" % name + RESET)
+
+    mp = dep["min_py"]
+    if mp and sys.version_info[:2] < mp:
+        print(YELLOW + "  ⚠ %s butuh Python %d.%d+ (kamu pakai %d.%d). Upgrade Python dulu." % (
+            name, mp[0], mp[1], sys.version_info[0], sys.version_info[1]) + RESET)
+        return False
+
+    manual = "python3 roez-tools.py --setup" + (" --repair" if err else "")
+    if not sys.stdin.isatty():
+        print(WHITE + "  Install dengan perintah:" + RESET)
+        print(CYAN + "    " + manual + RESET)
+        return False
+    print(WHITE + "  Bisa dipasang otomatis di environment terisolasi:" + RESET)
+    print(CYAN + "    " + VENV_DIR + RESET)
+    print()
+    if not confirm("  Install sekarang? [Y/n]: ", True):
+        print(WHITE + "  Install nanti dengan:" + RESET)
+        print(CYAN + "    " + manual + RESET)
+        return False
+    print()
+    return bool(setup_environment([key], repair=bool(err)).get(key))
+
+
+def startup_check():
+    """Cek cepat saat start. Kalau ada yang kurang, tawarkan install otomatis."""
+    if os.path.exists(SKIP_FILE) or not sys.stdin.isatty():
+        return
+    missing = []
+    for k, dep in DEPS.items():
+        mp = dep["min_py"]
+        if mp and sys.version_info[:2] < mp:
+            continue
+        if not dep_status(k)[0]:
+            missing.append(k)
+    if not missing:
+        return
+    screen("SETUP DEPENDENSI OSINT")
+    print(WHITE + "  Komponen belum terpasang: " + YELLOW + ", ".join(DEPS[k]["pip"] for k in missing) + RESET)
+    print(WHITE + "  Akan dipasang di environment terisolasi (Python sistem tidak disentuh):" + RESET)
+    print(CYAN + "    " + VENV_DIR + RESET)
+    print()
+    if confirm("  Install sekarang? [Y/n]: ", True):
+        print()
+        setup_environment(missing)
+        pause()
+    else:
+        try:
+            os.makedirs(APP_DIR, exist_ok=True)
+            open(SKIP_FILE, "w").close()
+        except OSError:
+            pass
+        print(YELLOW + "  Dilewati. Kapan saja bisa: python3 roez-tools.py --setup" + RESET)
+        time.sleep(1.2)
+
+
+def doctor():
+    screen("DOCTOR - DIAGNOSA LINGKUNGAN")
+
+    def row(label, value, ok=None):
+        mark = "" if ok is None else ((GREEN + "✔ ") if ok else (RED + "✘ "))
+        print(GREEN + f"  {label:<16}: " + mark + WHITE + str(value) + RESET)
+
+    row("Python", "%s (%s)" % (platform.python_version(), sys.executable))
+    row("Sistem", "%s %s" % (platform.system(), platform.release()))
+    pep668 = os.path.exists(os.path.join(sysconfig.get_path("stdlib"), "EXTERNALLY-MANAGED"))
+    row("pip global", "diblokir PEP 668 (normal, kita pakai venv)" if pep668 else "bebas")
+    healthy = venv_healthy()
+    row("Venv privat", VENV_DIR if healthy else "belum ada / rusak (%s)" % VENV_DIR, healthy)
+    print()
+    print(YELLOW + BOLD + "  DEPENDENSI PYTHON" + RESET)
+    for k, dep in DEPS.items():
+        mp = dep["min_py"]
+        if mp and sys.version_info[:2] < mp:
+            row(dep["pip"], "butuh Python %d.%d+" % mp, False)
+            continue
+        ok, py, err = dep_status(k, deep=True)
+        row(dep["pip"], py if ok else (err or "tidak ditemukan"), ok)
+    print()
+    print(YELLOW + BOLD + "  TOOL EKSTERNAL" + RESET)
+    for c in ("curl", "whois", "dig", "exiftool", "subfinder", "neofetch", "fastfetch"):
+        p = shutil.which(c)
+        row(c, p or "tidak ditemukan", bool(p))
+    print()
+    net = check_internet()
+    row("Internet", "tersambung" if net else "tidak terdeteksi", net)
+    row("Log install", LOG_FILE)
+    print()
+    print(CYAN + "  Perbaiki otomatis: python3 roez-tools.py --setup  (tambah --repair untuk install ulang)" + RESET)
+    pause()
+
+
+# ═══════════════════════════ FITUR 1-3 ═══════════════════════════
 
 def check_ip():
-    clear()
-    print_header()
-    width = get_terminal_width()
-    print(YELLOW + BOLD + "  CHECK YOUR IP".center(width) + RESET)
-    print()
+    screen("CHECK YOUR IP")
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -168,18 +806,17 @@ def check_ip():
     print(GREEN + f"  Hostname   : {WHITE}{socket.gethostname()}" + RESET)
     print(GREEN + f"  IP Lokal   : {WHITE}{local_ip}" + RESET)
     print(GREEN + f"  IP Publik  : {WHITE}{public_ip}" + RESET)
-    print()
-    input(CYAN + "  Tekan Enter untuk kembali ke menu..." + RESET)
+    pause()
 
 
 def search_locate():
-    clear()
-    print_header()
-    width = get_terminal_width()
-    print(YELLOW + BOLD + "  SEARCH LOCATE WITH IP".center(width) + RESET)
-    print()
+    screen("SEARCH LOCATE WITH IP")
     target = input(GREEN + "  Masukkan IP (kosongkan = IP publik sendiri): " + WHITE).strip()
     print(RESET)
+    if target and not (re.fullmatch(r"[0-9a-fA-F:.]+", target) or valid_domain(clean_domain(target))):
+        print(RED + "  ✘ Input tidak valid (isi IP atau domain)." + RESET)
+        pause()
+        return
     print(CYAN + "  Mengambil informasi..." + RESET)
     print()
     try:
@@ -211,21 +848,15 @@ def search_locate():
         print(RED + "  ✘ curl tidak ditemukan. Install: sudo apt install curl" + RESET)
     except Exception as e:
         print(RED + f"  ✘ Error: {e}" + RESET)
-    print()
-    input(CYAN + "  Tekan Enter untuk kembali ke menu..." + RESET)
+    pause()
 
 
 def check_system():
-    clear()
-    print_header()
-    width = get_terminal_width()
-    print(YELLOW + BOLD + "  CHECK SYSTEM".center(width) + RESET)
-    print()
+    screen("CHECK SYSTEM")
     for cmd in ["neofetch", "fastfetch"]:
-        if subprocess.call(["which", cmd], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
+        if has_cmd(cmd):
             subprocess.call([cmd])
-            print()
-            input(CYAN + "  Tekan Enter untuk kembali ke menu..." + RESET)
+            pause()
             return
     print(YELLOW + "  ⚠ neofetch tidak ditemukan. Info manual:" + RESET)
     print()
@@ -250,43 +881,85 @@ def check_system():
         print(GREEN + f"  {label}: {WHITE}{value}" + RESET)
     print()
     print(YELLOW + "  Tip install neofetch: sudo apt install neofetch" + RESET)
-    print()
-    input(CYAN + "  Tekan Enter untuk kembali ke menu..." + RESET)
+    pause()
+
+
+# ═══════════════════════════ FITUR 4: EMAIL (HOLEHE) ═══════════════════════════
+
+def parse_holehe_output(text):
+    """
+    Parse stdout holehe. Baris legenda ("[+] Email used, [-] Email not used, ...")
+    ikut berawalan [+], jadi harus dibuang supaya tidak terhitung sebagai platform.
+    Return None kalau tidak ada tanda holehe berjalan normal.
+    """
+    found, notused, limited, checked = [], 0, 0, None
+    marker = False
+    for raw in re.split(r"[\r\n]+", strip_ansi(text)):
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("[+] Email used"):
+            marker = True
+            continue
+        m = re.match(r"^(\d+)\s+websites checked", line)
+        if m:
+            checked = int(m.group(1))
+            marker = True
+            continue
+        if line.startswith("[+]"):
+            item = line[3:].strip()
+            if item and item not in found:
+                found.append(item)
+        elif line.startswith("[-]"):
+            notused += 1
+        elif line.startswith("[x]"):
+            limited += 1
+    if not (marker or found or notused or limited):
+        return None
+    return {"found": found, "notused": notused, "limited": limited, "checked": checked}
 
 
 def holehe_check():
-    clear()
-    print_header()
-    width = get_terminal_width()
-    print(YELLOW + BOLD + "  HOLEHE - EMAIL OSINT".center(width) + RESET)
-    print()
-    if subprocess.call(["which", "holehe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) != 0:
-        print(RED + "  ✘ holehe tidak ditemukan!" + RESET)
-        print(WHITE + "  Install dengan perintah:" + RESET)
-        print(CYAN + "    pip3 install holehe --break-system-packages" + RESET)
-        print()
-        input(CYAN + "  Tekan Enter untuk kembali ke menu..." + RESET)
+    screen("HOLEHE - EMAIL OSINT")
+    if not ensure_dep("holehe"):
+        pause()
         return
+    py = dep_status("holehe", deep=True)[1]
+
     email = input(GREEN + "  Masukkan email target: " + WHITE).strip()
-    if not email or "@" not in email:
+    print(RESET)
+    if not EMAIL_RE.match(email):
         print(RED + "  ✘ Email tidak valid!" + RESET)
-        print()
-        input(CYAN + "  Tekan Enter untuk kembali ke menu..." + RESET)
+        pause()
         return
-    print()
+    if not check_internet():
+        print(RED + "  ✘ Tidak ada koneksi internet." + RESET)
+        pause()
+        return
+
+    width = get_terminal_width()
+    sep = "─" * width
     print(CYAN + f"  Scanning email: {WHITE}{email}" + RESET)
     print()
-    sep = "─" * width
     print(CYAN + sep + RESET)
-    try:
-        result = run_with_spinner(["holehe", email], "Scanning email")
-        found = []
-        for line in result.splitlines():
-            line_strip = line.strip()
-            if "[+]" in line_strip:
-                platform_name = line_strip.replace("[+]", "").strip()
-                if platform_name:
-                    found.append(platform_name)
+
+    cmd = [py, "-c", HOLEHE_BOOT, "--no-color", "--no-clear", "--", email]
+    with Spinner("Scanning email"):
+        res = run_command(cmd, timeout=HOLEHE_TIMEOUT)
+
+    parsed = parse_holehe_output(res.out)
+    if res.interrupted:
+        print(YELLOW + "  ⚠ Scan dibatalkan (Ctrl+C)." + RESET)
+    elif parsed is None:
+        if res.timed_out:
+            print(RED + f"  ✘ Timeout setelah {fmt_duration(HOLEHE_TIMEOUT)} tanpa hasil." + RESET)
+        else:
+            print(RED + "  ✘ holehe gagal dijalankan:" + RESET)
+            for line in tail_lines(res.err or res.out, 4):
+                print(WHITE + "    " + line + RESET)
+            print(CYAN + "    Diagnosa: python3 roez-tools.py --doctor" + RESET)
+    else:
+        found = parsed["found"]
         if found:
             print(GREEN + BOLD + f"  ✔ Email [{email}] terdaftar di {len(found)} platform:" + RESET)
             print()
@@ -294,106 +967,113 @@ def holehe_check():
                 print(GREEN + f"  [{i:02d}] " + WHITE + p + RESET)
         else:
             print(YELLOW + f"  ⚠ Tidak ada platform yang ditemukan untuk: {email}" + RESET)
-    except Exception as e:
-        print(RED + f"  ✘ Error: {e}" + RESET)
+        if parsed["limited"]:
+            total = parsed["checked"] or (len(found) + parsed["notused"] + parsed["limited"])
+            print()
+            print(YELLOW + f"  ⚠ {parsed['limited']} dari {total} situs gagal dicek (rate limit / error)," + RESET)
+            print(YELLOW + "    hasil bisa kurang lengkap. Coba lagi beberapa menit lagi." + RESET)
     print()
     print(CYAN + sep + RESET)
-    print()
-    input(CYAN + "  Tekan Enter untuk kembali ke menu..." + RESET)
+    pause()
+
+
+# ═══════════════════════════ FITUR 5: USERNAME (SHERLOCK) ═══════════════════════════
+
+def parse_sherlock_line(line):
+    """Baris hasil sherlock -> (nama, url) atau None."""
+    line = strip_ansi(line).strip()
+    if not line.startswith("[+]"):
+        return None
+    m = SHERLOCK_FOUND_RE.match(line)
+    if m:
+        return (m.group(1).strip(), m.group(2))
+    rest = line[3:].strip()
+    return (rest, "") if rest else None
 
 
 def sherlock_check():
-    clear()
-    print_header()
-    width = get_terminal_width()
-    print(YELLOW + BOLD + "  SHERLOCK - USERNAME OSINT".center(width) + RESET)
-    print()
-
-    sherlock_cmd = None
-    for cmd in ["sherlock"]:
-        if subprocess.call(["which", cmd], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
-            sherlock_cmd = cmd
-            break
-
-    if not sherlock_cmd:
-
-        try:
-            subprocess.check_output(
-                ["python3", "-m", "sherlock", "--help"],
-                stderr=subprocess.DEVNULL
-            )
-            sherlock_cmd = "module"
-        except Exception:
-            pass
-
-    if not sherlock_cmd:
-        print(RED + "  ✘ sherlock tidak ditemukan!" + RESET)
-        print(WHITE + "  Install dengan perintah:" + RESET)
-        print(CYAN + "    pip3 install sherlock-project --break-system-packages" + RESET)
-        print(WHITE + "  atau:" + RESET)
-        print(CYAN + "    pip install sherlock-project" + RESET)
-        print()
-        input(CYAN + "  Tekan Enter untuk kembali ke menu..." + RESET)
+    screen("SHERLOCK - USERNAME OSINT")
+    if not ensure_dep("sherlock"):
+        pause()
         return
+    py = dep_status("sherlock", deep=True)[1]
 
-    username = input(GREEN + "  Masukkan username target: " + WHITE).strip()
+    username = input(GREEN + "  Masukkan username target: " + WHITE).strip().lstrip("@")
+    print(RESET)
     if not username:
         print(RED + "  ✘ Username tidak boleh kosong!" + RESET)
-        print()
-        input(CYAN + "  Tekan Enter untuk kembali ke menu..." + RESET)
+        pause()
+        return
+    if not USERNAME_RE.match(username):
+        print(RED + "  ✘ Username tidak valid (tanpa spasi, maks 64 karakter, tidak diawali '-')." + RESET)
+        pause()
+        return
+    if not check_internet():
+        print(RED + "  ✘ Tidak ada koneksi internet." + RESET)
+        pause()
         return
 
-    print()
+    width = get_terminal_width()
+    sep = "─" * width
     print(CYAN + f"  Scanning username: {WHITE}{username}" + RESET)
     print()
-    sep = "─" * width
     print(CYAN + sep + RESET)
 
+    found = []
+    seen = set()
+
+    def on_line(line):
+        item = parse_sherlock_line(line)
+        if item and item[1] + item[0] not in seen:
+            seen.add(item[1] + item[0])
+            found.append(item)
+
+    # cwd sementara: sherlock menulis <username>.txt ke folder kerja, jangan sampai nyampah.
+    workdir = tempfile.mkdtemp(prefix="roez-sherlock-")
     try:
-        if sherlock_cmd == "module":
-            cmd_list = ["python3", "-m", "sherlock", username]
+        cmd = [py, "-m", "sherlock_project", "--no-color", "--timeout", str(SHERLOCK_REQ_TIMEOUT), "--", username]
+        with Spinner(lambda: f"Scanning username ({len(found)} ditemukan)"):
+            res = run_command(cmd, timeout=SHERLOCK_TOTAL_TIMEOUT, cwd=workdir, on_line=on_line)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+    started = any(l.strip().startswith("[*]") for l in strip_ansi(res.out).splitlines())
+    if not found and not started and not res.interrupted:
+        if res.timed_out:
+            print(RED + f"  ✘ Timeout setelah {fmt_duration(SHERLOCK_TOTAL_TIMEOUT)} tanpa hasil." + RESET)
         else:
-            cmd_list = ["sherlock", username]
-
-        result = run_with_spinner(cmd_list, "Scanning username")
-
-        found = []
-        for line in result.splitlines():
-            line_strip = line.strip()
-
-            if "[+]" in line_strip:
-
-                parts = line_strip.replace("[+]", "").strip()
-                found.append(parts)
-
+            print(RED + "  ✘ sherlock gagal dijalankan:" + RESET)
+            for line in tail_lines(res.err or res.out, 4):
+                print(WHITE + "    " + line + RESET)
+            print(CYAN + "    Diagnosa: python3 roez-tools.py --doctor" + RESET)
+    else:
         if found:
             print(GREEN + BOLD + f"  ✔ Username [{username}] ditemukan di {len(found)} platform:" + RESET)
             print()
-            for i, p in enumerate(found, 1):
-                print(GREEN + f"  [{i:02d}] " + WHITE + p + RESET)
+            for i, (name, url) in enumerate(found, 1):
+                print(GREEN + f"  [{i:02d}] " + WHITE + (f"{name}: {url}" if url else name) + RESET)
         else:
             print(YELLOW + f"  ⚠ Username [{username}] tidak ditemukan di platform manapun." + RESET)
-
-    except Exception as e:
-        print(RED + f"  ✘ Error: {e}" + RESET)
-
+        if res.interrupted:
+            print()
+            print(YELLOW + "  ⚠ Scan dibatalkan (Ctrl+C) - hasil sebagian." + RESET)
+        elif res.timed_out:
+            print()
+            print(YELLOW + f"  ⚠ Scan dihentikan setelah {fmt_duration(SHERLOCK_TOTAL_TIMEOUT)} - hasil sebagian." + RESET)
     print()
     print(CYAN + sep + RESET)
-    print()
-    input(CYAN + "  Tekan Enter untuk kembali ke menu..." + RESET)
+    pause()
 
+
+# ═══════════════════════════ FITUR 6: PHONE ═══════════════════════════
 
 def phone_osint():
     screen("PHONE NUMBER OSINT")
-    try:
-        import phonenumbers
-        from phonenumbers import geocoder, carrier, timezone
-    except ImportError:
-        print(RED + "  ✘ library phonenumbers tidak ditemukan!" + RESET)
-        print(WHITE + "  Install dengan perintah:" + RESET)
-        print(CYAN + "    pip3 install phonenumbers --break-system-packages" + RESET)
+    if not ensure_dep("phonenumbers"):
         pause()
         return
+    phonenumbers, _ = try_import_phonenumbers()
+    from phonenumbers import geocoder, carrier, timezone
 
     raw = input(GREEN + "  Masukkan nomor (contoh: +6281234567890 / 081234567890): " + WHITE).strip()
     print(RESET)
@@ -409,14 +1089,14 @@ def phone_osint():
         pause()
         return
 
-    types = {
-        phonenumbers.PhoneNumberType.MOBILE: "Mobile",
-        phonenumbers.PhoneNumberType.FIXED_LINE: "Fixed Line",
-        phonenumbers.PhoneNumberType.FIXED_LINE_OR_MOBILE: "Fixed Line / Mobile",
-        phonenumbers.PhoneNumberType.TOLL_FREE: "Toll Free",
-        phonenumbers.PhoneNumberType.VOIP: "VoIP",
-        phonenumbers.PhoneNumberType.UNKNOWN: "Unknown",
+    T = phonenumbers.PhoneNumberType
+    names = {
+        "MOBILE": "Mobile", "FIXED_LINE": "Fixed Line", "FIXED_LINE_OR_MOBILE": "Fixed Line / Mobile",
+        "TOLL_FREE": "Toll Free", "PREMIUM_RATE": "Premium Rate", "SHARED_COST": "Shared Cost",
+        "VOIP": "VoIP", "PERSONAL_NUMBER": "Personal Number", "PAGER": "Pager", "UAN": "UAN",
+        "VOICEMAIL": "Voicemail", "UNKNOWN": "Unknown",
     }
+    types = {getattr(T, k): v for k, v in names.items() if hasattr(T, k)}
     ntype = phonenumbers.number_type(num)
     tz = ", ".join(timezone.time_zones_for_number(num)) or "-"
     fields = [
@@ -434,6 +1114,8 @@ def phone_osint():
     pause()
 
 
+# ═══════════════════════════ FITUR 7-10 ═══════════════════════════
+
 def exif_check():
     screen("EXIFTOOL - METADATA READER")
     if not has_cmd("exiftool"):
@@ -450,12 +1132,13 @@ def exif_check():
         print(RED + "  ✘ File tidak ditemukan!" + RESET)
         pause()
         return
+    path = os.path.abspath(path)          # cegah nama file berawalan '-' dibaca sebagai opsi
 
     width = get_terminal_width()
     sep = "─" * width
     print(CYAN + sep + RESET)
     try:
-        result = run_with_spinner(["exiftool", path], "Membaca metadata")
+        result = run_with_spinner(["exiftool", path], "Membaca metadata", timeout=60)
         lines = [l for l in result.splitlines() if ":" in l]
         if not lines:
             print(YELLOW + "  ⚠ Tidak ada metadata yang ditemukan." + RESET)
@@ -505,7 +1188,7 @@ def subfinder_check():
     sep = "─" * width
     print(CYAN + sep + RESET)
     try:
-        result = run_with_spinner(["subfinder", "-d", domain, "-silent"], "Mencari subdomain")
+        result = run_with_spinner(["subfinder", "-d", domain, "-silent"], "Mencari subdomain", timeout=300)
         found = sorted(set(l.strip() for l in result.splitlines() if l.strip()))
         if found:
             print(GREEN + BOLD + f"  ✔ Ditemukan {len(found)} subdomain untuk [{domain}]:" + RESET)
@@ -540,7 +1223,7 @@ def headers_ssl_check():
     try:
         raw = run_with_spinner(
             ["curl", "-sIL", "--max-time", "10", f"https://{host}"],
-            "Mengambil headers"
+            "Mengambil headers", timeout=30
         )
         blocks = [b for b in raw.replace("\r", "").split("\n\n") if b.strip()]
         if not blocks:
@@ -638,7 +1321,7 @@ def whois_dns_check():
         print(CYAN + "    Install: sudo apt install whois" + RESET)
     else:
         try:
-            result = run_with_spinner(["whois", domain], "Mengambil data whois")
+            result = run_with_spinner(["whois", domain], "Mengambil data whois", timeout=30)
             wanted = [
                 ("domain name", "Domain      "),
                 ("registrar:", "Registrar   "),
@@ -696,42 +1379,85 @@ def whois_dns_check():
 
 # ─────────────────────────── MAIN ───────────────────────────
 
+def parse_args():
+    p = argparse.ArgumentParser(
+        prog="roez-tools",
+        description="ROEZ TOOLS - toolkit OSINT / network / system berbasis menu terminal.",
+    )
+    p.add_argument("--setup", action="store_true",
+                   help="install dependensi OSINT (phonenumbers, holehe, sherlock) di environment terisolasi")
+    p.add_argument("--repair", action="store_true",
+                   help="install ulang paksa dependensi OSINT (dipakai bersama / menggantikan --setup)")
+    p.add_argument("--doctor", action="store_true",
+                   help="diagnosa lingkungan: Python, dependensi, tool eksternal, koneksi")
+    return p.parse_args()
+
+
 def main():
+    args = parse_args()
+    if os.name != "posix":
+        print("ROEZ TOOLS hanya mendukung Linux/macOS. Di Windows jalankan lewat WSL.")
+        sys.exit(1)
+    extend_path()
+
+    if args.doctor:
+        doctor()
+        return
+    if args.setup or args.repair:
+        screen("SETUP DEPENDENSI OSINT")
+        setup_environment(repair=args.repair)
+        pause()
+        return
+
+    startup_check()
+
+    actions = {
+        "1": check_ip,
+        "2": search_locate,
+        "3": check_system,
+        "4": holehe_check,
+        "5": sherlock_check,
+        "6": phone_osint,
+        "7": exif_check,
+        "8": subfinder_check,
+        "9": headers_ssl_check,
+        "10": whois_dns_check,
+    }
+
     while True:
         clear()
         print_header()
         print_menu()
-        choice = input(CYAN + "  roez" + WHITE + "@" + GREEN + "tools" + CYAN + " ❯ " + WHITE).strip()
+        try:
+            choice = input(CYAN + "  roez" + WHITE + "@" + GREEN + "tools" + CYAN + " ❯ " + WHITE).strip()
+        except (EOFError, KeyboardInterrupt):
+            choice = "11"
         print(RESET)
-        if choice == "1":
-            check_ip()
-        elif choice == "2":
-            search_locate()
-        elif choice == "3":
-            check_system()
-        elif choice == "4":
-            holehe_check()
-        elif choice == "5":
-            sherlock_check()
-        elif choice == "6":
-            phone_osint()
-        elif choice == "7":
-            exif_check()
-        elif choice == "8":
-            subfinder_check()
-        elif choice == "9":
-            headers_ssl_check()
-        elif choice == "10":
-            whois_dns_check()
-        elif choice == "11":
+        if choice in actions:
+            try:
+                actions[choice]()
+            except KeyboardInterrupt:
+                print()
+                print(YELLOW + "  ⚠ Dibatalkan." + RESET)
+                time.sleep(0.8)
+            except EOFError:
+                choice = "11"
+            except Exception as e:                      # bug di satu fitur jangan matikan seluruh menu
+                print(RED + f"  ✘ Terjadi error tak terduga: {type(e).__name__}: {e}" + RESET)
+                log("unexpected error in menu %s: %r" % (choice, e))
+                pause()
+        elif choice != "11":
+            print(RED + "  ✘ Pilihan tidak valid. Tekan Enter untuk coba lagi..." + RESET)
+            try:
+                input()
+            except (EOFError, KeyboardInterrupt):
+                choice = "11"
+        if choice == "11":
             clear()
             print()
             print(CYAN + "  Terima kasih telah menggunakan ROEZ TOOLS. Sampai jumpa!" + RESET)
             print()
             sys.exit(0)
-        else:
-            print(RED + "  ✘ Pilihan tidak valid. Tekan Enter untuk coba lagi..." + RESET)
-            input()
 
 
 if __name__ == "__main__":
