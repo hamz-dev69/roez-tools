@@ -116,7 +116,6 @@ ROEZ TOOLS targets Linux. On Windows, run it inside [WSL](https://learn.microsof
 
 ## Notes
 
-- Some features use third-party services and may have rate limits.
 - Results may be incomplete or inaccurate. Verify findings independently.
 - Use this tool only on targets you own or are authorized to investigate.
 
