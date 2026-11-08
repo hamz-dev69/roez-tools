@@ -26,6 +26,8 @@ The whole project is one Python file with a small dependency list.
 | 8  | Subdomain Finder       | Passive subdomain enumeration for a domain                                                      | [Subfinder](https://github.com/projectdiscovery/subfinder)           |
 | 9  | Security Headers + SSL | Checks six security headers (with a score) and the TLS certificate, including days until expiry | `curl`, Python `ssl`                                                 |
 | 10 | Whois + DNS Lookup     | Registrar, creation and expiry dates, nameservers, plus A, AAAA, MX, NS, and TXT records        | whois, dig                                                           |
+| 11 | SQL Injection Scanner  | Tests a URL parameter for SQL injection and lists any vulnerable parameters                     | [sqlmap](https://github.com/sqlmapproject/sqlmap)                   |
+| 12 | XSS Scanner            | Tests a URL parameter for reflected/DOM XSS                                                     | [XSStrike](https://github.com/s0md3v/XSStrike)                      |
 
 ## Requirements
 
@@ -73,6 +75,22 @@ go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
 ```
 
 `$HOME/go/bin` and `$HOME/.local/bin` are added to the search path automatically.
+
+**5. Install sqlmap (optional, for tool 11)**
+
+```
+sudo apt install sqlmap
+```
+
+**6. Install XSStrike (optional, for tool 12)**
+
+```
+git clone https://github.com/s0md3v/XSStrike.git
+cd XSStrike && pip install -r requirements.txt --break-system-packages
+sudo ln -s "$(pwd)/xsstrike.py" /usr/local/bin/xsstrike
+sudo chmod +x /usr/local/bin/xsstrike
+```
+
 > Missing tools do not crash the program. If a dependency is not found, the related feature prints the exact install command instead.
 
 ## Usage

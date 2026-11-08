@@ -4,6 +4,7 @@ import argparse
 import collections
 import glob
 import importlib.util
+import ipaddress
 import itertools
 import json
 import os
@@ -20,6 +21,7 @@ import sysconfig
 import tempfile
 import threading
 import time
+import urllib.parse
 
 RED    = "\033[1;31m"
 GREEN  = "\033[1;32m"
@@ -44,8 +46,6 @@ GRADIENT = [196, 202, 208, 214, 220, 226]
 
 # ═══════════════════════════ CONFIGURATION ═══════════════════════════
 
-# Private virtual environment used only by ROEZ TOOLS. Installing there avoids
-# PEP 668 errors and keeps the system Python untouched.
 APP_DIR   = os.path.join(
     os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share"),
     "roez-tools",
@@ -55,11 +55,10 @@ VENV_PY   = os.path.join(VENV_DIR, "bin", "python")
 LOG_FILE  = os.path.join(APP_DIR, "install.log")
 SKIP_FILE = os.path.join(APP_DIR, "skip_setup")
 
-HOLEHE_TIMEOUT         = 300   # seconds, total limit for an email scan
-SHERLOCK_REQ_TIMEOUT   = 15    # seconds per request (sherlock default is 60)
-SHERLOCK_TOTAL_TIMEOUT = 900   # seconds, total limit for a username scan
+HOLEHE_TIMEOUT         = 300   
+SHERLOCK_REQ_TIMEOUT   = 15    
+SHERLOCK_TOTAL_TIMEOUT = 900   
 
-# key -> package info. "probe" is an import statement proving the package really works.
 DEPS = collections.OrderedDict([
     ("phonenumbers", {"pip": "phonenumbers",     "module": "phonenumbers",    "probe": "import phonenumbers",
                       "script": None,            "min_py": None}),
@@ -69,9 +68,6 @@ DEPS = collections.OrderedDict([
                       "script": "sherlock",      "min_py": (3, 9)}),
 ])
 
-# holehe calls check_update() BEFORE scanning: it runs `pip3 install --upgrade holehe`
-# and then exit()s with no results whenever its version differs from PyPI (always fails
-# on PEP 668 systems, crashes when offline). It is disabled here; everything else runs as-is.
 HOLEHE_BOOT = (
     "import holehe.core as c\n"
     "if hasattr(c, 'check_update'):\n"
@@ -121,7 +117,9 @@ def print_menu():
         ("8 ",  "Subdomain Finder"),
         ("9 ",  "Security Headers + SSL"),
         ("10", "Whois + DNS Lookup"),
-        ("11", "Exit"),
+        ("11", "SQL Injection (sqlmap)"),
+        ("12", "XSS Scanner (XSStrike)"),
+        ("13", "Exit"),
     ]
     inner = 40
     pad = " " * max((get_terminal_width() - inner - 2) // 2, 0)
@@ -129,7 +127,7 @@ def print_menu():
     print(pad + CYAN + "║" + GREEN + BOLD + "MENU".center(inner) + CYAN + "║" + RESET)
     print(pad + CYAN + "╠" + "═" * inner + "╣" + RESET)
     for k, name in items:
-        color = RED if k == "11" else WHITE
+        color = RED if k == "13" else WHITE
         row = f"  [{k:>2}]  {name}".ljust(inner)
         print(pad + CYAN + "║" + color + row + CYAN + "║" + RESET)
     print(pad + CYAN + "╚" + "═" * inner + "╝" + RESET)
@@ -190,14 +188,31 @@ def fmt_duration(seconds):
 
 
 def clean_domain(raw):
-    d = raw.strip().lower()
+    d = raw.strip().lower().rstrip(".")
     d = re.sub(r"^[a-z]+://", "", d)
     d = d.split("/")[0].split(":")[0]
+    if "@" in d:
+        d = d.rsplit("@", 1)[-1]
     return d
 
 
 def valid_domain(d):
-    return bool(re.match(r"^([a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$", d))
+    if not d:
+        return False
+    try:
+        ascii_d = d.encode("idna").decode("ascii")
+    except Exception:
+        ascii_d = d
+    return bool(re.match(r"^([a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$", ascii_d))
+
+
+def valid_url(u):
+    """http(s) URL with a non-empty host."""
+    try:
+        parts = urllib.parse.urlsplit(u.strip())
+    except ValueError:
+        return False
+    return parts.scheme in ("http", "https") and bool(parts.netloc)
 
 
 def extend_path():
@@ -272,7 +287,7 @@ def run_command(cmd, timeout=120, cwd=None, on_line=None):
     reported through `interrupted`, so partial results can still be shown.
     """
     env = os.environ.copy()
-    env["PYTHONUNBUFFERED"] = "1"       # otherwise Python children deliver all output at the very end
+    env["PYTHONUNBUFFERED"] = "1"       
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONWARNINGS"] = "ignore"
 
@@ -799,18 +814,33 @@ def check_ip():
     pause()
 
 
+def parse_locate_target(raw):
+    """-> normalized IP/domain for ip-api, "" for "use my own IP", or None if invalid."""
+    raw = raw.strip()
+    if not raw:
+        return ""
+    try:
+        ipaddress.ip_address(raw)
+        return raw
+    except ValueError:
+        pass
+    d = clean_domain(raw)
+    return d if valid_domain(d) else None
+
+
 def search_locate():
     screen("SEARCH LOCATE WITH IP")
     target = input(GREEN + "  Enter IP (leave empty = your own public IP): " + WHITE).strip()
     print(RESET)
-    if target and not (re.fullmatch(r"[0-9a-fA-F:.]+", target) or valid_domain(clean_domain(target))):
+    query = parse_locate_target(target)
+    if query is None:
         print(RED + "  ✘ Invalid input (enter an IP address or a domain)." + RESET)
         pause()
         return
     print(CYAN + "  Fetching information..." + RESET)
     print()
     try:
-        url = f"http://ip-api.com/json/{target}?fields=status,message,country,regionName,city,zip,isp,org,as,mobile,proxy,hosting,query"
+        url = f"http://ip-api.com/json/{query}?fields=status,message,country,regionName,city,zip,isp,org,as,mobile,proxy,hosting,query"
         result = subprocess.check_output(
             ["curl", "-s", "--max-time", "8", url],
             stderr=subprocess.DEVNULL
@@ -1204,7 +1234,8 @@ def headers_ssl_check():
     print()
     try:
         raw = run_with_spinner(
-            ["curl", "-sIL", "--max-time", "10", f"https://{host}"],
+            ["curl", "-sL", "-A", "Mozilla/5.0 (X11; Linux x86_64) roez-tools",
+             "--max-time", "10", "-D", "-", "-o", "/dev/null", f"https://{host}"],
             "Fetching headers", timeout=30
         )
         blocks = [b for b in raw.replace("\r", "").split("\n\n") if b.strip()]
@@ -1217,6 +1248,16 @@ def headers_ssl_check():
                 k, v = line.split(":", 1)
                 headers[k.strip().lower()] = v.strip()
 
+        def header_ok(key, val):
+            if key == "x-content-type-options":
+                return "nosniff" in val.lower()
+            if key == "strict-transport-security":
+                m = re.search(r"max-age=(\d+)", val, re.I)
+                return bool(m) and int(m.group(1)) > 0
+            if key == "x-frame-options":
+                return val.strip().upper() in ("DENY", "SAMEORIGIN")
+            return True
+
         checks = [
             ("Strict-Transport-Security", "strict-transport-security"),
             ("Content-Security-Policy  ", "content-security-policy"),
@@ -1227,13 +1268,20 @@ def headers_ssl_check():
         ]
         score = 0
         for label, key in checks:
-            if key in headers:
+            val = headers.get(key)
+            if val is None and key == "x-frame-options" and "frame-ancestors" in headers.get("content-security-policy", "").lower():
+                print(GREEN + f"  ✔ {label}: {WHITE}via CSP frame-ancestors" + RESET)
                 score += 1
-                val = headers[key]
-                val = val if len(val) <= 40 else val[:37] + "..."
-                print(GREEN + f"  ✔ {label}: {WHITE}{val}" + RESET)
-            else:
+                continue
+            if val is None:
                 print(RED + f"  ✘ {label}: {YELLOW}missing" + RESET)
+                continue
+            disp = val if len(val) <= 40 else val[:37] + "..."
+            if header_ok(key, val):
+                score += 1
+                print(GREEN + f"  ✔ {label}: {WHITE}{disp}" + RESET)
+            else:
+                print(YELLOW + f"  ⚠ {label}: {WHITE}{disp} (weak value)" + RESET)
         print()
         color = GREEN if score >= 5 else (YELLOW if score >= 3 else RED)
         print(color + BOLD + f"  Score: {score}/{len(checks)} security headers enabled" + RESET)
@@ -1266,14 +1314,16 @@ def headers_ssl_check():
         print(GREEN + f"  {'TLS Version':<12}: {WHITE}{tls_version}" + RESET)
         print(GREEN + f"  {'SAN':<12}: {WHITE}{len(sans)} domains" + RESET)
         print()
-        if days_left < 0:
-            print(RED + BOLD + f"  ✘ Certificate EXPIRED {abs(days_left)} days ago!" + RESET)
-        elif days_left < 30:
+        if days_left < 30:
             print(YELLOW + BOLD + f"  ⚠ Certificate expires in {days_left} days" + RESET)
         else:
             print(GREEN + BOLD + f"  ✔ Certificate is valid, {days_left} days left" + RESET)
     except ssl.SSLCertVerificationError as e:
-        print(RED + f"  ✘ Invalid certificate: {e.verify_message}" + RESET)
+        msg = str(e.verify_message or e)
+        if "expired" in msg.lower():
+            print(RED + BOLD + "  ✘ Certificate has EXPIRED." + RESET)
+        else:
+            print(RED + f"  ✘ Invalid certificate: {msg}" + RESET)
     except Exception as e:
         print(RED + f"  ✘ Error: {e}" + RESET)
 
@@ -1316,20 +1366,24 @@ def whois_dns_check():
                 ("domain status", "Status"),
                 ("name server", "Nameserver"),
             ]
+            label_cap = {"Nameserver": 8, "Status": 6}
+            counts = collections.Counter()
             shown = set()
-            count = 0
+            total = 0
             for line in result.splitlines():
                 low = line.strip().lower()
                 for key, label in wanted:
                     if low.startswith(key) and ":" in line:
                         val = line.split(":", 1)[1].strip()
                         tag = (label, val)
-                        if val and tag not in shown and count < 20:
+                        cap = label_cap.get(label, 1)
+                        if val and tag not in shown and counts[label] < cap:
                             shown.add(tag)
-                            count += 1
+                            counts[label] += 1
+                            total += 1
                             print(GREEN + f"  {label:<12}: {WHITE}{val}" + RESET)
                         break
-            if count == 0:
+            if total == 0:
                 print(YELLOW + "  ⚠ Whois data not found or hidden." + RESET)
         except Exception as e:
             print(RED + f"  ✘ Error: {e}" + RESET)
@@ -1344,7 +1398,7 @@ def whois_dns_check():
         print(CYAN + "    Install: sudo apt install dnsutils" + RESET)
     else:
         for rtype in ["A", "AAAA", "MX", "NS", "TXT"]:
-            out = run_text(["dig", "+short", rtype, domain], timeout=8)
+            out = run_text(["dig", "+time=3", "+tries=1", "+short", rtype, domain], timeout=8)
             records = [l.strip() for l in out.splitlines() if l.strip()]
             if records:
                 print(GREEN + BOLD + f"  {rtype}" + RESET)
@@ -1355,6 +1409,161 @@ def whois_dns_check():
                 print(YELLOW + f"  {rtype}: no records" + RESET)
             print()
 
+    print(CYAN + sep + RESET)
+    pause()
+
+
+# ═══════════════════════════ FEATURE 11: SQLMAP ═══════════════════════════
+
+SQLMAP_TIMEOUT = 600
+
+
+def parse_sqlmap_output(text):
+    """Extract vulnerable parameters and the not-injectable verdict from sqlmap's stdout."""
+    text = strip_ansi(text)
+    vulnerable = []
+    for line in text.splitlines():
+        line = line.strip()
+        m = re.match(r"^Parameter:\s*(.+?)\s*\(", line)
+        if m and m.group(1) not in vulnerable:
+            vulnerable.append(m.group(1))
+    not_injectable = bool(re.search(
+        r"does not seem to be injectable|all tested parameters do not appear to be injectable",
+        text, re.I))
+    return vulnerable, not_injectable
+
+
+def sqlmap_check():
+    screen("SQLMAP - SQL INJECTION SCANNER")
+    if not has_cmd("sqlmap"):
+        print(RED + "  ✘ sqlmap not found!" + RESET)
+        print(WHITE + "  Install it with:" + RESET)
+        print(CYAN + "    sudo apt install sqlmap" + RESET)
+        print(CYAN + "    or: git clone https://github.com/sqlmapproject/sqlmap.git" + RESET)
+        pause()
+        return
+
+    url = input(GREEN + "  Enter target URL with a parameter (e.g. http://example.com/page.php?id=1): " + WHITE).strip()
+    print(RESET)
+    if not valid_url(url):
+        print(RED + "  ✘ Invalid URL (must start with http:// or https://)." + RESET)
+        pause()
+        return
+    if not check_internet():
+        print(RED + "  ✘ No internet connection." + RESET)
+        pause()
+        return
+    print(YELLOW + "  ⚠ Only test targets you own or are authorized to test." + RESET)
+    if not confirm("  Continue? [y/N]: ", False):
+        pause()
+        return
+
+    width = get_terminal_width()
+    sep = "─" * width
+    print(CYAN + f"  Scanning: {WHITE}{url}" + RESET)
+    print()
+    print(CYAN + sep + RESET)
+
+    cmd = ["sqlmap", "-u", url, "--batch", "--random-agent", "--level=1", "--risk=1"]
+    with Spinner("Running sqlmap"):
+        res = run_command(cmd, timeout=SQLMAP_TIMEOUT)
+
+    if res.interrupted:
+        print(YELLOW + "  ⚠ Scan canceled (Ctrl+C)." + RESET)
+    else:
+        vulnerable, not_injectable = parse_sqlmap_output(res.out)
+        if vulnerable:
+            plural = "" if len(vulnerable) == 1 else "s"
+            print(RED + BOLD + f"  ✘ {len(vulnerable)} vulnerable parameter{plural} found:" + RESET)
+            print()
+            for i, p in enumerate(vulnerable, 1):
+                print(RED + f"  [{i:02d}] " + WHITE + p + RESET)
+        elif not_injectable:
+            print(GREEN + f"  ✔ No injectable parameters found for: {url}" + RESET)
+        elif res.timed_out:
+            print(RED + f"  ✘ Timed out after {fmt_duration(SQLMAP_TIMEOUT)} without a clear result." + RESET)
+        else:
+            print(YELLOW + "  ⚠ sqlmap did not report a clear result:" + RESET)
+            for line in tail_lines(res.err or res.out, 5):
+                print(WHITE + "    " + line + RESET)
+    print()
+    print(CYAN + sep + RESET)
+    pause()
+
+
+# ═══════════════════════════ FEATURE 12: XSSTRIKE ═══════════════════════════
+
+XSSTRIKE_TIMEOUT = 300
+
+
+def parse_xsstrike_output(text):
+    """Best-effort extraction of findings from XSStrike's stdout."""
+    found = []
+    for line in strip_ansi(text).splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("[+]") or line.startswith("[!]") or "vulnerable" in line.lower():
+            if line not in found:
+                found.append(line)
+    return found
+
+
+def xsstrike_check():
+    screen("XSSTRIKE - XSS SCANNER")
+    if not has_cmd("xsstrike"):
+        print(RED + "  ✘ xsstrike not found!" + RESET)
+        print(WHITE + "  Install it with:" + RESET)
+        print(CYAN + "    git clone https://github.com/s0md3v/XSStrike.git" + RESET)
+        print(CYAN + "    cd XSStrike && pip install -r requirements.txt --break-system-packages" + RESET)
+        print(CYAN + "    sudo ln -s \"$(pwd)/xsstrike.py\" /usr/local/bin/xsstrike" + RESET)
+        print(CYAN + "    sudo chmod +x /usr/local/bin/xsstrike" + RESET)
+        pause()
+        return
+
+    url = input(GREEN + "  Enter target URL with a parameter (e.g. http://example.com/search?q=test): " + WHITE).strip()
+    print(RESET)
+    if not valid_url(url):
+        print(RED + "  ✘ Invalid URL (must start with http:// or https://)." + RESET)
+        pause()
+        return
+    if not check_internet():
+        print(RED + "  ✘ No internet connection." + RESET)
+        pause()
+        return
+    print(YELLOW + "  ⚠ Only test targets you own or are authorized to test." + RESET)
+    if not confirm("  Continue? [y/N]: ", False):
+        pause()
+        return
+
+    width = get_terminal_width()
+    sep = "─" * width
+    print(CYAN + f"  Scanning: {WHITE}{url}" + RESET)
+    print()
+    print(CYAN + sep + RESET)
+
+    cmd = ["xsstrike", "-u", url, "--skip"]
+    with Spinner("Running XSStrike"):
+        res = run_command(cmd, timeout=XSSTRIKE_TIMEOUT)
+
+    if res.interrupted:
+        print(YELLOW + "  ⚠ Scan canceled (Ctrl+C)." + RESET)
+    else:
+        found = parse_xsstrike_output(res.out)
+        if found:
+            print(RED + BOLD + f"  ✘ {len(found)} finding(s):" + RESET)
+            print()
+            for i, line in enumerate(found, 1):
+                print(RED + f"  [{i:02d}] " + WHITE + line + RESET)
+        elif res.timed_out:
+            print(RED + f"  ✘ Timed out after {fmt_duration(XSSTRIKE_TIMEOUT)} without a clear result." + RESET)
+        elif res.rc != 0 and not res.out.strip():
+            print(RED + "  ✘ xsstrike failed to run:" + RESET)
+            for line in tail_lines(res.err or res.out, 4):
+                print(WHITE + "    " + line + RESET)
+        else:
+            print(GREEN + f"  ✔ No XSS findings reported for: {url}" + RESET)
+    print()
     print(CYAN + sep + RESET)
     pause()
 
@@ -1404,6 +1613,8 @@ def main():
         "8": subfinder_check,
         "9": headers_ssl_check,
         "10": whois_dns_check,
+        "11": sqlmap_check,
+        "12": xsstrike_check,
     }
 
     while True:
@@ -1413,7 +1624,7 @@ def main():
         try:
             choice = input(CYAN + "  roez" + WHITE + "@" + GREEN + "tools" + CYAN + " ❯ " + WHITE).strip()
         except (EOFError, KeyboardInterrupt):
-            choice = "11"
+            choice = "13"
         print(RESET)
         if choice in actions:
             try:
@@ -1423,18 +1634,18 @@ def main():
                 print(YELLOW + "  ⚠ Canceled." + RESET)
                 time.sleep(0.8)
             except EOFError:
-                choice = "11"
+                choice = "13"
             except Exception as e:                      # a bug in one feature must not kill the whole menu
                 print(RED + f"  ✘ Unexpected error: {type(e).__name__}: {e}" + RESET)
                 log("unexpected error in menu %s: %r" % (choice, e))
                 pause()
-        elif choice != "11":
+        elif choice != "13":
             print(RED + "  ✘ Invalid choice. Press Enter to try again..." + RESET)
             try:
                 input()
             except (EOFError, KeyboardInterrupt):
-                choice = "11"
-        if choice == "11":
+                choice = "13"
+        if choice == "13":
             clear()
             print()
             print(CYAN + "  Thank you for using ROEZ TOOLS. Goodbye!" + RESET)
