@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 
 import argparse
 import collections
@@ -119,7 +120,7 @@ def print_menu():
         ("10", "Whois + DNS Lookup"),
         ("11", "SQL Injection (sqlmap)"),
         ("12", "XSS Scanner (XSStrike)"),
-        ("13", "Exit"),
+        ("0 ", "Exit"),
     ]
     inner = 40
     pad = " " * max((get_terminal_width() - inner - 2) // 2, 0)
@@ -127,7 +128,7 @@ def print_menu():
     print(pad + CYAN + "║" + GREEN + BOLD + "MENU".center(inner) + CYAN + "║" + RESET)
     print(pad + CYAN + "╠" + "═" * inner + "╣" + RESET)
     for k, name in items:
-        color = RED if k == "13" else WHITE
+        color = RED if k.strip() == "0" else WHITE
         row = f"  [{k:>2}]  {name}".ljust(inner)
         print(pad + CYAN + "║" + color + row + CYAN + "║" + RESET)
     print(pad + CYAN + "╚" + "═" * inner + "╝" + RESET)
@@ -187,7 +188,7 @@ def fmt_duration(seconds):
     return "%d minutes" % (seconds // 60) if seconds >= 60 and seconds % 60 == 0 else "%d seconds" % seconds
 
 
-def clean_domain(raw):
+def clean_domain(raw: str) -> str:
     d = raw.strip().lower().rstrip(".")
     d = re.sub(r"^[a-z]+://", "", d)
     d = d.split("/")[0].split(":")[0]
@@ -196,7 +197,7 @@ def clean_domain(raw):
     return d
 
 
-def valid_domain(d):
+def valid_domain(d: str) -> bool:
     if not d:
         return False
     try:
@@ -206,13 +207,55 @@ def valid_domain(d):
     return bool(re.match(r"^([a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$", ascii_d))
 
 
-def valid_url(u):
-    """http(s) URL with a non-empty host."""
+def valid_url(u: str) -> bool:
+    """
+    True for a syntactically valid http(s) URL with a usable host: a domain name,
+    "localhost", a bare IPv4 address, or a bracketed IPv6 address (e.g. "http://[::1]:8080/").
+    Rejects missing schemes/hosts, malformed netlocs (stray spaces, no host), and
+    out-of-range or non-numeric ports.
+    """
+    if not u or not isinstance(u, str):
+        return False
     try:
         parts = urllib.parse.urlsplit(u.strip())
     except ValueError:
         return False
-    return parts.scheme in ("http", "https") and bool(parts.netloc)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        return False
+    try:
+        host = parts.hostname       # None for a missing host
+        _ = parts.port              # raises ValueError if out of range / non-numeric
+    except ValueError:
+        return False
+    if not host or " " in parts.netloc:
+        return False
+    if host == "localhost":
+        return True
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    return valid_domain(host)
+
+
+def is_local_target(host: str) -> bool:
+    """
+    True if `host` clearly refers to this machine or a private/lab network
+    (localhost, loopback, RFC1918/link-local addresses) - i.e. somewhere that
+    does not require outbound internet access to reach. Used so that local
+    security-lab targets (DVWA, Juice Shop, etc. on 127.0.0.1/192.168.x.x)
+    are never blocked by the "no internet connection" check.
+    """
+    if not host:
+        return False
+    if host.lower() == "localhost":
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_loopback or ip.is_private or ip.is_link_local
 
 
 def extend_path():
@@ -237,8 +280,15 @@ def has_cmd(cmd):
     return shutil.which(cmd) is not None
 
 
-def check_internet(timeout=2):
-    """True if outbound connections work. The check is skipped when a proxy is configured."""
+def check_internet(timeout: int = 2) -> bool:
+    """
+    True if *outbound internet* connectivity works (tests well-known public
+    hosts). This says nothing about whether any particular scan target is
+    reachable - that is the scan tool's job to report. Callers that may be
+    pointed at a local/lab target should check is_local_target() first and
+    skip this call entirely for those, rather than treating "no internet"
+    as "can't reach the target". The check is skipped when a proxy is configured.
+    """
     for k in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
         if os.environ.get(k):
             return True
@@ -249,6 +299,43 @@ def check_internet(timeout=2):
         except OSError:
             continue
     return False
+
+
+def prompt_domain(prompt_text: str) -> str | None:
+    """
+    Prompt for a domain, normalize it, and validate it. On invalid input, prints
+    the error and pauses, returning None so the caller can simply `return`.
+    Dedupes the identical prompt/validate/pause block used by several features.
+    """
+    domain = clean_domain(input(GREEN + prompt_text + WHITE))
+    print(RESET)
+    if not valid_domain(domain):
+        print(RED + "  ✘ Invalid domain!" + RESET)
+        pause()
+        return None
+    return domain
+
+
+def prompt_authorized_target_url(prompt_text: str) -> str | None:
+    """
+    Prompt for a target URL for an active scan (sqlmap/XSStrike-style tool):
+    validates the URL, then requires outbound internet UNLESS the target is
+    local (localhost, loopback, or a private/lab IP - so local lab
+    environments are never blocked). Returns the URL, or None if the caller
+    should abort (the message has already been shown).
+    """
+    url = input(GREEN + prompt_text + WHITE).strip()
+    print(RESET)
+    if not valid_url(url):
+        print(RED + "  ✘ Invalid URL (must be http:// or https://, with a valid host)." + RESET)
+        pause()
+        return None
+    host = urllib.parse.urlsplit(url).hostname or ""
+    if not is_local_target(host) and not check_internet():
+        print(RED + "  ✘ No internet connection." + RESET)
+        pause()
+        return None
+    return url
 
 
 # ═══════════════════════════ PROCESS RUNNER ═══════════════════════════
@@ -299,6 +386,7 @@ def run_command(cmd, timeout=120, cwd=None, on_line=None):
             bufsize=1, start_new_session=True,
         )
     except OSError as e:
+        log_exception("run_command exec failed (%s)" % (cmd[0] if cmd else "?"), e)
         errf.close()
         return RunResult("", str(e), 127, False, False)
 
@@ -321,8 +409,8 @@ def run_command(cmd, timeout=120, cwd=None, on_line=None):
             if on_line:
                 try:
                     on_line(line)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log_exception("run_command on_line callback", e)
     except KeyboardInterrupt:
         interrupted = True
         _terminate(proc)
@@ -413,12 +501,25 @@ def run_with_spinner(cmd, text="Scanning", timeout=120, cwd=None):
     return res.out
 
 
-def run_text(cmd, timeout=15):
-    """Run a command and return its stdout (no error even if the exit code is non-zero)."""
+def run_text(cmd: list, timeout: int = 15) -> str:
+    """
+    Run a short-lived command and return its stdout as text. A non-zero exit
+    code is not an error (e.g. `dig` legitimately exits non-zero for "no records").
+    A missing executable or a timeout returns "" and is logged (command name
+    only - never the arguments, which may carry a user-supplied target).
+    """
+    name = cmd[0] if cmd else "?"
     try:
         r = subprocess.run(cmd, capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
-        return r.stdout.decode(errors="ignore")
-    except Exception:
+        return r.stdout.decode("utf-8", errors="ignore")
+    except FileNotFoundError as e:
+        log_exception("run_text exec not found (%s)" % name, e)
+        return ""
+    except subprocess.TimeoutExpired as e:
+        log_exception("run_text timed out (%s)" % name, e)
+        return ""
+    except Exception as e:
+        log_exception("run_text failed (%s)" % name, e)
         return ""
 
 
@@ -439,7 +540,13 @@ def reset_status_cache():
     _STATUS_CACHE.clear()
 
 
-def log(msg):
+def log(msg: str) -> None:
+    """
+    Append a line to the install/diagnostic log (rotated at 1 MB).
+    Callers must not pass raw user input here (emails, usernames, phone numbers,
+    domains/URLs, credentials) - log only command names, exception types, and
+    other non-identifying diagnostic context. See log_exception() below.
+    """
     try:
         os.makedirs(APP_DIR, exist_ok=True)
         if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 1024 * 1024:
@@ -448,6 +555,15 @@ def log(msg):
             f.write("[%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
     except OSError:
         pass
+
+
+def log_exception(context: str, exc: Exception) -> None:
+    """
+    Log that something failed, for later diagnosis, without the exception's own
+    message - which may embed the raw target the user typed (a domain, email,
+    phone number, or URL). Only the feature name and exception type are recorded.
+    """
+    log("%s: %s" % (context, type(exc).__name__))
 
 
 def extra_site_paths():
@@ -868,6 +984,7 @@ def search_locate():
         print(RED + "  ✘ curl not found. Install: sudo apt install curl" + RESET)
     except Exception as e:
         print(RED + f"  ✘ Error: {e}" + RESET)
+        log_exception("search_locate", e)
     pause()
 
 
@@ -1170,6 +1287,7 @@ def exif_check():
                 print(YELLOW + "  ⚠ This file contains GPS location data." + RESET)
     except Exception as e:
         print(RED + f"  ✘ Error: {e}" + RESET)
+        log_exception("exif_check", e)
     print()
     print(CYAN + sep + RESET)
     pause()
@@ -1186,11 +1304,8 @@ def subfinder_check():
         pause()
         return
 
-    domain = clean_domain(input(GREEN + "  Enter target domain (e.g. example.com): " + WHITE))
-    print(RESET)
-    if not valid_domain(domain):
-        print(RED + "  ✘ Invalid domain!" + RESET)
-        pause()
+    domain = prompt_domain("  Enter target domain (e.g. example.com): ")
+    if domain is None:
         return
 
     print(CYAN + f"  Scanning domain: {WHITE}{domain}" + RESET)
@@ -1211,6 +1326,7 @@ def subfinder_check():
             print(YELLOW + f"  ⚠ No subdomains found for: {domain}" + RESET)
     except Exception as e:
         print(RED + f"  ✘ Error: {e}" + RESET)
+        log_exception("subfinder_check", e)
     print()
     print(CYAN + sep + RESET)
     pause()
@@ -1218,11 +1334,8 @@ def subfinder_check():
 
 def headers_ssl_check():
     screen("SECURITY HEADERS + SSL CHECKER")
-    host = clean_domain(input(GREEN + "  Enter domain (e.g. example.com): " + WHITE))
-    print(RESET)
-    if not valid_domain(host):
-        print(RED + "  ✘ Invalid domain!" + RESET)
-        pause()
+    host = prompt_domain("  Enter domain (e.g. example.com): ")
+    if host is None:
         return
 
     width = get_terminal_width()
@@ -1289,6 +1402,7 @@ def headers_ssl_check():
             print(GREEN + f"  Server: {WHITE}{headers['server']}" + RESET)
     except Exception as e:
         print(RED + f"  ✘ Error: {e}" + RESET)
+        log_exception("headers_ssl_check(headers)", e)
 
     # ---- SSL Certificate ----
     print()
@@ -1326,6 +1440,7 @@ def headers_ssl_check():
             print(RED + f"  ✘ Invalid certificate: {msg}" + RESET)
     except Exception as e:
         print(RED + f"  ✘ Error: {e}" + RESET)
+        log_exception("headers_ssl_check(ssl)", e)
 
     print()
     print(CYAN + sep + RESET)
@@ -1334,11 +1449,8 @@ def headers_ssl_check():
 
 def whois_dns_check():
     screen("WHOIS + DNS LOOKUP")
-    domain = clean_domain(input(GREEN + "  Enter domain (e.g. example.com): " + WHITE))
-    print(RESET)
-    if not valid_domain(domain):
-        print(RED + "  ✘ Invalid domain!" + RESET)
-        pause()
+    domain = prompt_domain("  Enter domain (e.g. example.com): ")
+    if domain is None:
         return
 
     width = get_terminal_width()
@@ -1387,6 +1499,7 @@ def whois_dns_check():
                 print(YELLOW + "  ⚠ Whois data not found or hidden." + RESET)
         except Exception as e:
             print(RED + f"  ✘ Error: {e}" + RESET)
+            log_exception("whois_dns_check", e)
 
     # ---- DNS ----
     print()
@@ -1417,20 +1530,56 @@ def whois_dns_check():
 
 SQLMAP_TIMEOUT = 600
 
+SqlmapResult = collections.namedtuple("SqlmapResult", "status parameters reason")
+# status is one of: "vulnerable", "not_vulnerable", "inconclusive"
 
-def parse_sqlmap_output(text):
-    """Extract vulnerable parameters and the not-injectable verdict from sqlmap's stdout."""
-    text = strip_ansi(text)
+_SQLMAP_ERROR_PATTERNS = [
+    (re.compile(r"unable to connect to the target url", re.I), "could not connect to the target URL"),
+    (re.compile(r"\[CRITICAL\]", re.I), "sqlmap reported a critical error"),
+    (re.compile(r"WAF/IPS", re.I), "a WAF/IPS was detected and may have blocked testing"),
+    (re.compile(r"all testable parameters.*(?:skip|excluded)", re.I), "sqlmap skipped the parameters"),
+    (re.compile(r"no parameter\(s\) (?:found|to test)", re.I), "sqlmap found no testable parameter in the URL"),
+    (re.compile(r"connection (?:timed out|refused|reset)", re.I), "a connection error occurred during the scan"),
+]
+
+_SQLMAP_SAFE_PATTERNS = [
+    re.compile(r"does not seem to be injectable", re.I),
+    re.compile(r"all tested parameters do not appear to be injectable", re.I),
+    re.compile(r"parameter.*(?:is|appears) not injectable", re.I),
+]
+
+
+def parse_sqlmap_output(text: str) -> SqlmapResult:
+    """
+    Classify sqlmap's stdout as vulnerable / not_vulnerable / inconclusive.
+
+    A confirmed "Parameter: x (...)" injection point always wins - that is
+    sqlmap's own positive finding. A scan is only ever reported "not_vulnerable"
+    when sqlmap's own not-injectable verdict is present AND no error/WAF/
+    connection-problem line was also seen; the mere ABSENCE of a vulnerable
+    match (empty output, a crash, a connection failure) is never enough to
+    call a target safe - it falls back to "inconclusive" instead.
+    """
+    clean = strip_ansi(text or "")
+    if not clean.strip():
+        return SqlmapResult("inconclusive", [], "sqlmap produced no output")
+
     vulnerable = []
-    for line in text.splitlines():
-        line = line.strip()
-        m = re.match(r"^Parameter:\s*(.+?)\s*\(", line)
+    for line in clean.splitlines():
+        m = re.match(r"^Parameter:\s*(.+?)\s*\(", line.strip())
         if m and m.group(1) not in vulnerable:
             vulnerable.append(m.group(1))
-    not_injectable = bool(re.search(
-        r"does not seem to be injectable|all tested parameters do not appear to be injectable",
-        text, re.I))
-    return vulnerable, not_injectable
+    if vulnerable:
+        return SqlmapResult("vulnerable", vulnerable, "")
+
+    for pattern, reason in _SQLMAP_ERROR_PATTERNS:
+        if pattern.search(clean):
+            return SqlmapResult("inconclusive", [], reason)
+
+    if any(p.search(clean) for p in _SQLMAP_SAFE_PATTERNS):
+        return SqlmapResult("not_vulnerable", [], "")
+
+    return SqlmapResult("inconclusive", [], "sqlmap's verdict could not be determined from its output")
 
 
 def sqlmap_check():
@@ -1443,19 +1592,10 @@ def sqlmap_check():
         pause()
         return
 
-    url = input(GREEN + "  Enter target URL with a parameter (e.g. http://example.com/page.php?id=1): " + WHITE).strip()
-    print(RESET)
-    if not valid_url(url):
-        print(RED + "  ✘ Invalid URL (must start with http:// or https://)." + RESET)
-        pause()
-        return
-    if not check_internet():
-        print(RED + "  ✘ No internet connection." + RESET)
-        pause()
-        return
-    print(YELLOW + "  ⚠ Only test targets you own or are authorized to test." + RESET)
-    if not confirm("  Continue? [y/N]: ", False):
-        pause()
+    url = prompt_authorized_target_url(
+        "  Enter target URL with a parameter (e.g. http://example.com/page.php?id=1): "
+    )
+    if url is None:
         return
 
     width = get_terminal_width()
@@ -1464,28 +1604,35 @@ def sqlmap_check():
     print()
     print(CYAN + sep + RESET)
 
-    cmd = ["sqlmap", "-u", url, "--batch", "--random-agent", "--level=1", "--risk=1"]
+    cmd = ["sqlmap", "-u", url, "--batch", "--random-agent", "--level=5", "--risk=1"]
     with Spinner("Running sqlmap"):
         res = run_command(cmd, timeout=SQLMAP_TIMEOUT)
 
     if res.interrupted:
-        print(YELLOW + "  ⚠ Scan canceled (Ctrl+C)." + RESET)
+        print(YELLOW + "  ⚠ Scan canceled (Ctrl+C) - result is incomplete." + RESET)
     else:
-        vulnerable, not_injectable = parse_sqlmap_output(res.out)
-        if vulnerable:
-            plural = "" if len(vulnerable) == 1 else "s"
-            print(RED + BOLD + f"  ✘ {len(vulnerable)} vulnerable parameter{plural} found:" + RESET)
+        result = parse_sqlmap_output(res.out)
+        if result.status == "vulnerable":
+            plural = "" if len(result.parameters) == 1 else "s"
+            print(RED + BOLD + f"  ✘ {len(result.parameters)} vulnerable parameter{plural} found:" + RESET)
             print()
-            for i, p in enumerate(vulnerable, 1):
+            for i, p in enumerate(result.parameters, 1):
                 print(RED + f"  [{i:02d}] " + WHITE + p + RESET)
-        elif not_injectable:
-            print(GREEN + f"  ✔ No injectable parameters found for: {url}" + RESET)
-        elif res.timed_out:
-            print(RED + f"  ✘ Timed out after {fmt_duration(SQLMAP_TIMEOUT)} without a clear result." + RESET)
+        elif result.status == "not_vulnerable":
+            print(GREEN + "  ✔ No injectable parameters found (reported by sqlmap)." + RESET)
         else:
-            print(YELLOW + "  ⚠ sqlmap did not report a clear result:" + RESET)
-            for line in tail_lines(res.err or res.out, 5):
-                print(WHITE + "    " + line + RESET)
+            if res.timed_out:
+                print(RED + f"  ✘ Timed out after {fmt_duration(SQLMAP_TIMEOUT)} - result is inconclusive." + RESET)
+            else:
+                print(YELLOW + f"  ⚠ Inconclusive: {result.reason}." + RESET)
+            tail = tail_lines(res.err or res.out, 5)
+            if tail:
+                print()
+                for line in tail:
+                    print(WHITE + "    " + line + RESET)
+        if res.timed_out and not res.interrupted and result.status != "inconclusive":
+            print()
+            print(YELLOW + f"  ⚠ Scan stopped after {fmt_duration(SQLMAP_TIMEOUT)} - partial result." + RESET)
     print()
     print(CYAN + sep + RESET)
     pause()
@@ -1496,17 +1643,78 @@ def sqlmap_check():
 XSSTRIKE_TIMEOUT = 300
 
 
-def parse_xsstrike_output(text):
-    """Best-effort extraction of findings from XSStrike's stdout."""
-    found = []
-    for line in strip_ansi(text).splitlines():
-        line = line.strip()
+XSStrikeResult = collections.namedtuple("XSStrikeResult", "status findings reason")
+# status is one of: "vulnerable", "not_vulnerable", "inconclusive"
+
+# [+] and [!] are XSStrike's generic info/warning prefixes (progress, WAF notices,
+# parameter counts, etc.) - NOT findings by themselves. Only count a line as a
+# finding when it actually names a vulnerability, and only if it is not a
+# negated statement ("not vulnerable", "no vulnerabilities found").
+_XSS_VECTOR_RE = re.compile(r"^\s*vector for\b", re.I)
+# Exact word "vulnerable" only - NOT "vulnerab\w*", which also matches the plain
+# noun "vulnerabilities" used in harmless progress messages ("Checking for DOM
+# vulnerabilities"). That broader match was a real false-positive source caught
+# by this module's own test suite (see tests/test_roez_tools.py).
+_XSS_VULN_WORD_RE = re.compile(r"\bvulnerable\b", re.I)
+_XSS_NEGATION_RE = re.compile(r"\b(no|not|n[’']t|zero|0)\b[^.\n]{0,20}\bvulnerable\b", re.I)
+
+_XSS_ERROR_PATTERNS = [
+    re.compile(r"traceback \(most recent call last\)", re.I),
+    re.compile(r"connectionerror|max retries exceeded", re.I),
+    re.compile(r"connection (?:refused|timed out|reset)", re.I),
+    re.compile(r"no parameters? to test", re.I),
+    re.compile(r"waf detected", re.I),
+    re.compile(r"unable to (?:connect|fetch)", re.I),
+]
+
+_XSS_SAFE_PATTERNS = [
+    re.compile(r"no reflections? found", re.I),
+    re.compile(r"\b0\s+reflections\b", re.I),
+    re.compile(r"no vulnerabilit(?:y|ies) found", re.I),
+]
+
+
+def parse_xsstrike_output(text: str) -> XSStrikeResult:
+    """
+    Best-effort classification of XSStrike's stdout as vulnerable / not_vulnerable
+    / inconclusive. XSStrike has no single structured "result" line, so this is
+    necessarily pattern-based (see the module docstring note in the README); the
+    goals are to avoid two specific failure modes:
+      - false positive: treating every informational [+]/[!] line as a finding
+      - false negative: missing a finding because the line also contains a
+        negation ("not vulnerable") is handled by NOT excluding on negation
+        alone - only lines that are themselves phrased as a negative verdict
+        are excluded, via _XSS_NEGATION_RE.
+    When the output doesn't clearly match either verdict, the result is
+    "inconclusive" - it is never silently reported as safe.
+    """
+    clean = strip_ansi(text or "")
+    if not clean.strip():
+        return XSStrikeResult("inconclusive", [], "XSStrike produced no output")
+
+    findings = []
+    for raw in clean.splitlines():
+        line = raw.strip()
         if not line:
             continue
-        if line.startswith("[+]") or line.startswith("[!]") or "vulnerable" in line.lower():
-            if line not in found:
-                found.append(line)
-    return found
+        if _XSS_VECTOR_RE.match(line):
+            findings.append(line)
+        elif _XSS_VULN_WORD_RE.search(line) and not _XSS_NEGATION_RE.search(line):
+            findings.append(line)
+
+    seen = set()
+    findings = [f for f in findings if not (f in seen or seen.add(f))]
+    if findings:
+        return XSStrikeResult("vulnerable", findings, "")
+
+    for pattern in _XSS_ERROR_PATTERNS:
+        if pattern.search(clean):
+            return XSStrikeResult("inconclusive", [], "XSStrike reported a connection/environment problem")
+
+    if any(p.search(clean) for p in _XSS_SAFE_PATTERNS):
+        return XSStrikeResult("not_vulnerable", [], "")
+
+    return XSStrikeResult("inconclusive", [], "XSStrike's verdict could not be determined from its output")
 
 
 def xsstrike_check():
@@ -1521,19 +1729,10 @@ def xsstrike_check():
         pause()
         return
 
-    url = input(GREEN + "  Enter target URL with a parameter (e.g. http://example.com/search?q=test): " + WHITE).strip()
-    print(RESET)
-    if not valid_url(url):
-        print(RED + "  ✘ Invalid URL (must start with http:// or https://)." + RESET)
-        pause()
-        return
-    if not check_internet():
-        print(RED + "  ✘ No internet connection." + RESET)
-        pause()
-        return
-    print(YELLOW + "  ⚠ Only test targets you own or are authorized to test." + RESET)
-    if not confirm("  Continue? [y/N]: ", False):
-        pause()
+    url = prompt_authorized_target_url(
+        "  Enter target URL with a parameter (e.g. http://example.com/search?q=test): "
+    )
+    if url is None:
         return
 
     width = get_terminal_width()
@@ -1547,22 +1746,29 @@ def xsstrike_check():
         res = run_command(cmd, timeout=XSSTRIKE_TIMEOUT)
 
     if res.interrupted:
-        print(YELLOW + "  ⚠ Scan canceled (Ctrl+C)." + RESET)
+        print(YELLOW + "  ⚠ Scan canceled (Ctrl+C) - result is incomplete." + RESET)
     else:
-        found = parse_xsstrike_output(res.out)
-        if found:
-            print(RED + BOLD + f"  ✘ {len(found)} finding(s):" + RESET)
+        result = parse_xsstrike_output(res.out)
+        if result.status == "vulnerable":
+            print(RED + BOLD + f"  ✘ {len(result.findings)} finding(s):" + RESET)
             print()
-            for i, line in enumerate(found, 1):
+            for i, line in enumerate(result.findings, 1):
                 print(RED + f"  [{i:02d}] " + WHITE + line + RESET)
-        elif res.timed_out:
-            print(RED + f"  ✘ Timed out after {fmt_duration(XSSTRIKE_TIMEOUT)} without a clear result." + RESET)
-        elif res.rc != 0 and not res.out.strip():
-            print(RED + "  ✘ xsstrike failed to run:" + RESET)
-            for line in tail_lines(res.err or res.out, 4):
-                print(WHITE + "    " + line + RESET)
+        elif result.status == "not_vulnerable":
+            print(GREEN + "  ✔ No XSS findings reported by XSStrike." + RESET)
         else:
-            print(GREEN + f"  ✔ No XSS findings reported for: {url}" + RESET)
+            if res.timed_out:
+                print(RED + f"  ✘ Timed out after {fmt_duration(XSSTRIKE_TIMEOUT)} - result is inconclusive." + RESET)
+            else:
+                print(YELLOW + f"  ⚠ Inconclusive: {result.reason}." + RESET)
+            tail = tail_lines(res.err or res.out, 4)
+            if tail:
+                print()
+                for line in tail:
+                    print(WHITE + "    " + line + RESET)
+        if res.timed_out and not res.interrupted and result.status != "inconclusive":
+            print()
+            print(YELLOW + f"  ⚠ Scan stopped after {fmt_duration(XSSTRIKE_TIMEOUT)} - partial result." + RESET)
     print()
     print(CYAN + sep + RESET)
     pause()
@@ -1624,7 +1830,7 @@ def main():
         try:
             choice = input(CYAN + "  roez" + WHITE + "@" + GREEN + "tools" + CYAN + " ❯ " + WHITE).strip()
         except (EOFError, KeyboardInterrupt):
-            choice = "13"
+            choice = "0"
         print(RESET)
         if choice in actions:
             try:
@@ -1634,18 +1840,18 @@ def main():
                 print(YELLOW + "  ⚠ Canceled." + RESET)
                 time.sleep(0.8)
             except EOFError:
-                choice = "13"
+                choice = "0"
             except Exception as e:                      # a bug in one feature must not kill the whole menu
                 print(RED + f"  ✘ Unexpected error: {type(e).__name__}: {e}" + RESET)
-                log("unexpected error in menu %s: %r" % (choice, e))
+                log_exception("menu choice %s" % choice, e)
                 pause()
-        elif choice != "13":
+        elif choice != "0":
             print(RED + "  ✘ Invalid choice. Press Enter to try again..." + RESET)
             try:
                 input()
             except (EOFError, KeyboardInterrupt):
-                choice = "13"
-        if choice == "13":
+                choice = "0"
+        if choice == "0":
             clear()
             print()
             print(CYAN + "  Thank you for using ROEZ TOOLS. Goodbye!" + RESET)
