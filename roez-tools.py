@@ -10,6 +10,7 @@ import itertools
 import json
 import os
 import platform
+import pty
 import re
 import shutil
 import signal
@@ -435,6 +436,99 @@ def run_command(cmd, timeout=120, cwd=None, on_line=None):
         errf.close()
 
     return RunResult("\n".join(lines), err, proc.returncode, state["timed_out"], interrupted)
+
+
+def run_command_pty(cmd, timeout=120, cwd=None, on_line=None):
+    """
+    Like run_command(), but gives the child process a pseudo-terminal for its
+    stdout/stderr instead of a plain pipe. Tools such as sqlmap and XSStrike
+    only emit their own ANSI colors when they detect a real terminal
+    (os.isatty()); piping their output - as run_command() does - makes them
+    print it in plain monochrome instead. A pty makes os.isatty() true for the
+    child, so its native colored output (the same colors you'd see running it
+    directly in a terminal) comes through unchanged, with no color scheme of
+    our own to maintain or keep in sync with the tool's own log levels.
+
+    stdout and stderr share the pty, as they would in a real terminal, so the
+    returned RunResult always has err == "" and out holds everything,
+    including the child's raw ANSI escape codes. Same timeout/SIGTERM-then-
+    SIGKILL/Ctrl+C handling as run_command(); same RunResult shape.
+    """
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONWARNINGS"] = "ignore"
+    env.setdefault("TERM", "xterm-256color")
+
+    master_fd, slave_fd = pty.openpty()
+    try:
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL, stdout=slave_fd, stderr=slave_fd,
+            cwd=cwd, env=env, start_new_session=True,
+        )
+    except OSError as e:
+        log_exception("run_command_pty exec failed (%s)" % (cmd[0] if cmd else "?"), e)
+        os.close(master_fd)
+        os.close(slave_fd)
+        return RunResult("", str(e), 127, False, False)
+
+    os.close(slave_fd)     # only the child needs its end; keeping it open here
+                            # would stop the master read from ever seeing EOF
+
+    state = {"timed_out": False}
+
+    def _on_timeout():
+        state["timed_out"] = True
+        _terminate(proc)
+
+    timer = threading.Timer(timeout, _on_timeout)
+    timer.daemon = True
+    timer.start()
+
+    chunks = []
+    buf = b""
+    interrupted = False
+    try:
+        while True:
+            try:
+                data = os.read(master_fd, 4096)
+            except OSError:
+                break          # child exited and closed its end of the pty
+            if not data:
+                break
+            chunks.append(data)
+            if on_line:
+                buf += data
+                while b"\n" in buf:
+                    raw, buf = buf.split(b"\n", 1)
+                    try:
+                        on_line(raw.decode("utf-8", errors="ignore").rstrip("\r"))
+                    except Exception as e:
+                        log_exception("run_command_pty on_line callback", e)
+    except KeyboardInterrupt:
+        interrupted = True
+        _terminate(proc)
+    finally:
+        timer.cancel()
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+
+    if buf and on_line:                    # a final partial line with no trailing \n
+        try:
+            on_line(buf.decode("utf-8", errors="ignore").rstrip("\r"))
+        except Exception as e:
+            log_exception("run_command_pty on_line callback", e)
+
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        _signal_group(proc, signal.SIGKILL)
+        proc.wait()
+
+    out = b"".join(chunks).decode("utf-8", errors="ignore")
+    return RunResult(out, "", proc.returncode, state["timed_out"], interrupted)
 
 
 class Spinner(object):
@@ -1604,10 +1698,16 @@ def sqlmap_check():
     print()
     print(CYAN + sep + RESET)
 
-    cmd = ["sqlmap", "-u", url, "--batch", "--random-agent", "--level=5", "--risk=1"]
-    with Spinner("Running sqlmap"):
-        res = run_command(cmd, timeout=SQLMAP_TIMEOUT)
+    def on_line(line: str) -> None:
+        if not line.strip():
+            return
+        print("  " + line + RESET)      # sqlmap's own colors, just indented + reset at line end
 
+    cmd = ["sqlmap", "-u", url, "--batch", "--random-agent", "--level=5", "--risk=1"]
+    res = run_command_pty(cmd, timeout=SQLMAP_TIMEOUT, on_line=on_line)
+
+    print()
+    print(CYAN + sep + RESET)
     if res.interrupted:
         print(YELLOW + "  ⚠ Scan canceled (Ctrl+C) - result is incomplete." + RESET)
     else:
@@ -1741,10 +1841,16 @@ def xsstrike_check():
     print()
     print(CYAN + sep + RESET)
 
-    cmd = ["xsstrike", "-u", url, "--skip"]
-    with Spinner("Running XSStrike"):
-        res = run_command(cmd, timeout=XSSTRIKE_TIMEOUT)
+    def on_line(line: str) -> None:
+        if not line.strip():
+            return
+        print("  " + line + RESET)      # XSStrike's own colors, just indented + reset at line end
 
+    cmd = ["xsstrike", "-u", url, "--skip"]
+    res = run_command_pty(cmd, timeout=XSSTRIKE_TIMEOUT, on_line=on_line)
+
+    print()
+    print(CYAN + sep + RESET)
     if res.interrupted:
         print(YELLOW + "  ⚠ Scan canceled (Ctrl+C) - result is incomplete." + RESET)
     else:
